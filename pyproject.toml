@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["backend"]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = ["tests/*", "backend/__pycache__/*"]

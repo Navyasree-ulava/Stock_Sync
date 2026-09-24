@@ -1,0 +1,33 @@
+services:
+  # ── Backend Web Service ──────────────────────────────────────────────────────
+  - type: web
+    name: stockquery-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stockquery-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true          # Render auto-generates a secure random value
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "60"
+      - key: GROQ_API_KEY
+        sync: false                  # Set manually in Render dashboard
+      - key: ELEVENLABS_API_KEY
+        sync: false                  # Optional — set manually in Render dashboard
+      - key: ELEVENLABS_VOICE_ID
+        value: "21m00Tcm4TlvDq8ikWAM"
+      - key: ALLOWED_ORIGINS
+        sync: false                  # Set to your Vercel frontend URL after deploy
+
+  # ── PostgreSQL Database ──────────────────────────────────────────────────────
+databases:
+  - name: stockquery-db
+    databaseName: stockquery_db
+    user: stockquery
+    plan: free

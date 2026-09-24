@@ -1,0 +1,30 @@
+# ── Backend Dockerfile ────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps: gcc for bcrypt, libpq for psycopg2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source — backend and mcp_server must both be present
+# so mcp_server/server.py can import from backend/db/
+COPY backend/ ./backend/
+COPY mcp_server/ ./mcp_server/
+
+WORKDIR /app/backend
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
+
+# Run migrations then start the server.
+# Seeding is intentionally removed — new users start with empty inventory.
+# To seed a demo account manually: docker exec -it stockquery-backend python seed_db.py
+CMD ["sh", "-c", "python -c \"from db.connection import engine; from db.migrations import run_migrations; run_migrations(engine)\" && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"]
