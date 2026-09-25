@@ -26,5 +26,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
 
 # Run migrations then start the server.
 # Seeding is intentionally removed — new users start with empty inventory.
-# To seed a demo account manually: docker exec -it stockquery-backend python seed_db.py
+# To seed a demo account manually: docker exec -it stocksync-backend python seed_db.py
 CMD ["sh", "-c", "python -c \"from db.connection import engine; from db.migrations import run_migrations; run_migrations(engine)\" && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"]

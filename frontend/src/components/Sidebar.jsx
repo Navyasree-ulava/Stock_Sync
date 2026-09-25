@@ -1,4 +1,4 @@
-// Sidebar.jsx — StockQuery AI · Premium Navigation Panel
+// Sidebar.jsx — StockSync · Premium Navigation Panel
 import { useState, useEffect } from 'react'
 import axios from 'axios'
 
@@ -48,10 +48,7 @@ export default function Sidebar({ activeNav, setActiveNav, onQuery, sidebarOpen,
             <path d="M6 7h4M6 10h8M6 13h6" stroke="#00ff88" strokeWidth="1.2" strokeLinecap="round"/>
           </svg>
         </div>
-        <div>
-          <div className="brand-name">StockQuery</div>
-          <div className="brand-tag">AI</div>
-        </div>
+        <div className="brand-name">Stock<span className="text-accent">Sync</span></div>
       </div>
 
       {/* ── Primary Nav ───────────────────────────────────────── */}

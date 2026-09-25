@@ -26,7 +26,7 @@ MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 
 MAX_TURNS: int = int(os.environ.get("LLM_MAX_TURNS", "10"))
 
-SYSTEM_PROMPT = """You are StockQuery AI, an intelligent inventory assistant with read and write access to a real PostgreSQL database.
+SYSTEM_PROMPT = """You are StockSync, an intelligent inventory assistant with read and write access to a real PostgreSQL database.
 
 RULES (follow strictly):
 1. ANALYTICS & CHARTS: For graphs, charts, breakdowns, or category lists → use `get_inventory_analytics`, `get_category_analytics`, or `get_all_categories`.

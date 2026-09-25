@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://stockquery:stockpassword@localhost:5432/stockquery_db"
+    "postgresql://stocksync:stocksync_password@localhost:5433/stocksync"
 )
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")

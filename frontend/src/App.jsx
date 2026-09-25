@@ -1,4 +1,4 @@
-// App.jsx — StockQuery AI v4.0 — Premium SaaS Redesign
+// App.jsx — StockSync v4.0 — Premium SaaS Redesign
 import { useState, useRef, useEffect, useCallback } from 'react'
 import axios from 'axios'
 import MessageBubble from './components/MessageBubble'
@@ -19,7 +19,35 @@ if (API_BASE) {
   axios.defaults.baseURL = API_BASE
 }
 
-const savedToken = localStorage.getItem('sq_token')
+const STORAGE_TOKEN_KEY = 'stocksync_token'
+const STORAGE_USER_KEY = 'stocksync_user'
+const LEGACY_TOKEN_KEY = 'sq_token'
+const LEGACY_USER_KEY = 'sq_user'
+
+// Move existing legacy sessions to the StockSync keys on first load.
+const getMigratedStorageValue = (key, legacyKey) => {
+  const currentValue = localStorage.getItem(key)
+  const legacyValue = localStorage.getItem(legacyKey)
+
+  if (currentValue === null && legacyValue !== null) {
+    localStorage.setItem(key, legacyValue)
+  }
+  if (legacyValue !== null) {
+    localStorage.removeItem(legacyKey)
+  }
+
+  return currentValue ?? legacyValue
+}
+
+const savedToken = getMigratedStorageValue(STORAGE_TOKEN_KEY, LEGACY_TOKEN_KEY)
+const savedUserValue = getMigratedStorageValue(STORAGE_USER_KEY, LEGACY_USER_KEY)
+let savedUser = null
+try {
+  savedUser = savedUserValue ? JSON.parse(savedUserValue) : null
+} catch {
+  localStorage.removeItem(STORAGE_USER_KEY)
+}
+
 if (savedToken) {
   axios.defaults.headers.common['Authorization'] = `Bearer ${savedToken}`
 }
@@ -63,9 +91,9 @@ const MicIcon = () => (
 )
 
 export default function App() {
-  const [token, setToken] = useState(localStorage.getItem('sq_token') || null)
-  const [currentUser, setCurrentUser] = useState(JSON.parse(localStorage.getItem('sq_user')) || null)
-  const [authState, setAuthState] = useState(localStorage.getItem('sq_token') ? 'authenticated' : 'landing')
+  const [token, setToken] = useState(savedToken || null)
+  const [currentUser, setCurrentUser] = useState(savedUser)
+  const [authState, setAuthState] = useState(savedToken ? 'authenticated' : 'landing')
 
   const [messages, setMessages]   = useState([])
   const [input, setInput]         = useState('')
@@ -140,8 +168,8 @@ export default function App() {
   }, [authState])
 
   const handleAuthSuccess = (newToken, user, rememberMe) => {
-    localStorage.setItem('sq_token', newToken)
-    localStorage.setItem('sq_user', JSON.stringify(user))
+    localStorage.setItem(STORAGE_TOKEN_KEY, newToken)
+    localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(user))
     axios.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
     setToken(newToken)
     setCurrentUser(user)
@@ -156,8 +184,10 @@ export default function App() {
     } catch (e) {
       // Ignore network errors on logout
     }
-    localStorage.removeItem('sq_token')
-    localStorage.removeItem('sq_user')
+    localStorage.removeItem(STORAGE_TOKEN_KEY)
+    localStorage.removeItem(STORAGE_USER_KEY)
+    localStorage.removeItem(LEGACY_TOKEN_KEY)
+    localStorage.removeItem(LEGACY_USER_KEY)
     delete axios.defaults.headers.common['Authorization']
     setToken(null)
     setCurrentUser(null)
@@ -300,7 +330,7 @@ export default function App() {
               <span /><span /><span />
             </button>
             <div className="topbar-breadcrumb">
-              <span className="breadcrumb-root">StockQuery</span>
+              <span className="breadcrumb-root">StockSync</span>
               <span className="breadcrumb-sep">/</span>
               <span className="breadcrumb-current">
                 {activeNav === 'dashboard' ? 'Dashboard'

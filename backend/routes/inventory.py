@@ -131,7 +131,7 @@ async def download_sample_csv():
     return StreamingResponse(
         io.StringIO(csv_content),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=stockquery_sample.csv"}
+        headers={"Content-Disposition": "attachment; filename=stocksync_sample.csv"}
     )
 
 

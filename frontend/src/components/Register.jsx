@@ -72,7 +72,7 @@ export default function Register({ onRegisterSuccess, onNavigateToLogin }) {
         {/* Content */}
         <div className="auth-body">
           <div className="auth-brand">
-            <h2>StockQuery <span className="text-accent">AI</span></h2>
+            <h2>Stock<span className="text-accent">Sync</span></h2>
             <p>Register a new retailer/merchant partition...</p>
           </div>
 

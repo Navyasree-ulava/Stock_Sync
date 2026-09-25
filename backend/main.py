@@ -1,5 +1,5 @@
 """
-main.py — StockQuery AI FastAPI Backend
+main.py — StockSync FastAPI Backend
 
 Architecture:
   React Frontend
@@ -60,7 +60,7 @@ from routes.users import router as users_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ──
-    log.info("=== StockQuery AI starting up ===")
+    log.info("=== StockSync starting up ===")
 
     # 1. Run DB migrations (creates tables if not exist)
     try:
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown ──
-    log.info("=== StockQuery AI shutting down ===")
+    log.info("=== StockSync shutting down ===")
     await mcp_manager.stop()
 
 
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
-    title="StockQuery AI",
+    title="StockSync",
     description=(
         "Natural language inventory management powered by Llama-3.3-70B via Groq. "
         "Single source of truth: PostgreSQL."
@@ -130,7 +130,7 @@ async def health_check():
     from ai.agent import PROVIDER, MODEL
     return {
         "status": "ok",
-        "service": "StockQuery AI",
+        "service": "StockSync",
         "version": "3.0.0",
         "database": "postgresql",
         "provider": PROVIDER,

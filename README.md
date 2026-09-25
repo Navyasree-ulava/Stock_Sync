@@ -1,6 +1,6 @@
-# StockQuery AI
+# StockSync
 
-StockQuery AI is a multi-tenant retail inventory application with a React dashboard, FastAPI API, PostgreSQL persistence, and an optional natural-language inventory assistant. The assistant uses an OpenAI-compatible model from Groq and accesses inventory through Model Context Protocol (MCP) tools.
+StockSync is a multi-tenant retail inventory application with a React dashboard, FastAPI API, PostgreSQL persistence, and an optional natural-language inventory assistant. The assistant uses an OpenAI-compatible model from Groq and accesses inventory through Model Context Protocol (MCP) tools.
 
 > **Project status:** the CRUD, import, authentication, and AI flows are implemented, but parts of the UI and deployment setup are still experimental. See [Known limitations](#known-limitations) before using it in production.
 
@@ -138,7 +138,17 @@ docker compose down
 docker compose down -v
 ```
 
-`docker compose down -v` permanently deletes the local PostgreSQL data stored in the `pgdata` volume.
+`docker compose down -v` permanently deletes the local PostgreSQL data stored in the `stocksync-pgdata` volume.
+
+## Existing installations after the StockSync rename
+
+The application, containers, PostgreSQL role/database, MCP server identity, and browser-storage keys now use **StockSync** / `stocksync`.
+
+- Existing browser sessions are migrated automatically from `sq_token` and `sq_user` to `stocksync_token` and `stocksync_user`.
+- The Compose project and volume are now `stocksync` and `stocksync-pgdata`. An older PostgreSQL volume is not renamed automatically; back it up and migrate it with `pg_dump`/`pg_restore` before removing the old volume.
+- For a disposable local installation with no data to preserve, remove the old containers and start the new stack with `docker compose up --build`.
+- Editing `render.yaml` does not rename an already-created Render service or database. Rename or migrate those resources in the Render dashboard.
+- Rename the GitHub repository, Vercel project, deployed hostname, and `VITE_API_URL`/CORS settings in their respective dashboards.
 
 ## Local development without Docker
 
@@ -213,6 +223,9 @@ The backend loads the repository-root `.env` file.
 | --- | --- | --- | --- |
 | `SECRET_KEY` | **Yes** | none | HS256 JWT signing key; the backend refuses to import without it |
 | `DATABASE_URL` | Yes in practice | local PostgreSQL URL | SQLAlchemy connection string; Compose overrides it with the internal service URL |
+| `POSTGRES_USER` | Docker Compose | `stocksync` | PostgreSQL role used by the Compose database |
+| `POSTGRES_PASSWORD` | Docker Compose | `stocksync_password` | Local Compose database credential; change it for shared environments |
+| `POSTGRES_DB` | Docker Compose | `stocksync` | Local Compose database name |
 | `ALLOWED_ORIGINS` | No | localhost origins | Comma-separated CORS allowlist |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `60` | Access-token lifetime |
 | `GROQ_API_KEY` | Required for `/query` | none | Groq API credential |
@@ -343,13 +356,13 @@ npm run preview
 The seeder creates or resets a local demo account and **deletes that account's existing products** before inserting demo inventory.
 
 ```bash
-docker exec -it stockquery-backend python seed_db.py
+docker exec -it stocksync-backend python seed_db.py
 ```
 
 Local credentials:
 
 ```text
-Email: demo@stockquery.ai
+Email: demo@stocksync.ai
 Password: demo123
 ```
 
@@ -358,7 +371,7 @@ Use this only for local development.
 ## Project structure
 
 ```text
-StockQueryAI/
+StockSync/
 ├── backend/
 │   ├── ai/agent.py                 # LLM and MCP tool loop
 │   ├── auth/                       # Password and JWT handling

@@ -1,4 +1,4 @@
-// Dashboard.jsx — StockQuery AI · Premium Dashboard
+// Dashboard.jsx — StockSync · Premium Dashboard
 import { useState, useEffect } from 'react'
 import axios from 'axios'
 
@@ -142,7 +142,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
       {isEmpty ? (
         <div className="dash-onboarding-wrapper">
           <div className="dash-onboarding-card">
-            <h2 className="dash-onboarding-title">👋 Welcome to StockQuery AI</h2>
+            <h2 className="dash-onboarding-title">👋 Welcome to StockSync</h2>
             <p className="dash-onboarding-sub">
               You haven't imported any inventory yet. Let's get started by importing your products database.
             </p>

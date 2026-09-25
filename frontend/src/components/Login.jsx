@@ -33,7 +33,7 @@ export default function Login({ onAuthSuccess, onNavigateToRegister }) {
 
   const handleForgotPassword = (e) => {
     e.preventDefault()
-    alert("Password reset request placeholder. Please contact your system administrator at admin@stockquery.ai.")
+    alert("Password reset request placeholder. Please contact your system administrator at admin@stocksync.ai.")
   }
 
   return (
@@ -52,7 +52,7 @@ export default function Login({ onAuthSuccess, onNavigateToRegister }) {
         {/* Content */}
         <div className="auth-body">
           <div className="auth-brand">
-            <h2>StockQuery <span className="text-accent">AI</span></h2>
+            <h2>Stock<span className="text-accent">Sync</span></h2>
             <p>Accessing multi-tenant secure inventory logs...</p>
           </div>
 

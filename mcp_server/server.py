@@ -1,5 +1,5 @@
 """
-server.py — StockQuery AI MCP Server
+server.py — StockSync MCP Server
 
 Exposes all inventory tools via JSON-RPC.
 ALL queries are scoped to the authenticated user's data via user_id.
@@ -41,7 +41,7 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8001"))
 
 mcp = FastMCP(
-    "StockQuery Inventory Server",
+    "StockSync Inventory Server",
     host=MCP_HOST,
     port=MCP_PORT,
     streamable_http_path="/mcp",

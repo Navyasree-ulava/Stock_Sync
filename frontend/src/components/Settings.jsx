@@ -1,4 +1,4 @@
-// Settings.jsx — StockQuery AI · User Preferences
+// Settings.jsx — StockSync · User Preferences
 import { useState } from 'react'
 
 export default function Settings({ currentUser, onLogout }) {

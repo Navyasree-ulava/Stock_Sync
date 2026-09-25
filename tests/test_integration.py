@@ -281,7 +281,7 @@ class TestInventory:
     def test_download_sample_csv(self, client, auth_headers):
         resp = client.get("/inventory/sample-csv", headers=auth_headers)
         assert resp.status_code == 200
-        assert "attachment; filename=stockquery_sample.csv" in resp.headers["content-disposition"]
+        assert "attachment; filename=stocksync_sample.csv" in resp.headers["content-disposition"]
         assert "Product Name,Category" in resp.text
 
     def test_preview_csv(self, client, auth_headers):
@@ -437,6 +437,7 @@ class TestHealth:
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "ok"
+        assert body["service"] == "StockSync"
         assert body["database"] == "postgresql"
 
 

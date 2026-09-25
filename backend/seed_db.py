@@ -2,7 +2,7 @@
 seed_db.py — Seed PostgreSQL with demo user and inventory products.
 
 Creates:
-  - Demo user: demo@stockquery.ai / demo123
+  - Demo user: demo@stocksync.ai / demo123
   - 1000+ products from inventory_1000.csv, all assigned to demo user
 
 Run: python backend/seed_db.py [path/to/products.csv]
@@ -32,7 +32,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Demo credentials ─────────────────────────────────────────
-DEMO_EMAIL    = "demo@stockquery.ai"
+DEMO_EMAIL    = "demo@stocksync.ai"
 DEMO_PASSWORD = "demo123"
 
 # ─── CSV column aliases ───────────────────────────────────────

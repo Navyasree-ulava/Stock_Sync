@@ -1,5 +1,5 @@
 /* ================================================================
-   StockQuery AI v2.0 — Terminal Command Center
+   StockSync v2.0 — Terminal Command Center
    Palette: Graphite + Acid Green + Signal Orange
    Geometry: 0px–2px sharp edges. No glassmorphism. No purple.
    Layout: Fixed sidebar + scrollable main panel
@@ -113,14 +113,6 @@ code   { font-family: var(--font-mono); }
   font-weight: 700;
   color: var(--text-0);
   letter-spacing: -0.2px;
-}
-
-.brand-tag {
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--green);
-  letter-spacing: 2px;
-  font-family: var(--font-mono);
 }
 
 /* Nav */

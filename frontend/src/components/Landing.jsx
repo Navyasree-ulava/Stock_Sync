@@ -1,4 +1,4 @@
-// Landing.jsx — StockQuery AI Public Landing Page
+// Landing.jsx — StockSync Public Landing Page
 export default function Landing({ onLogin, onRegister }) {
   return (
     <div className="landing">
@@ -7,7 +7,7 @@ export default function Landing({ onLogin, onRegister }) {
       <nav className="land-nav">
         <div className="land-nav-logo">
           <span className="land-logo-icon">◈</span>
-          <span className="land-logo-text">StockQuery AI</span>
+          <span className="land-logo-text">StockSync</span>
         </div>
         <div className="land-nav-links">
           <a href="#features" className="land-nav-link">Features</a>
@@ -52,7 +52,7 @@ export default function Landing({ onLogin, onRegister }) {
             <span className="mockup-dot" style={{ background: '#ff453a' }} />
             <span className="mockup-dot" style={{ background: '#ffd700' }} />
             <span className="mockup-dot" style={{ background: '#39ff14' }} />
-            <span className="mockup-url">stockquery.ai/dashboard</span>
+            <span className="mockup-url">stocksync.ai/dashboard</span>
           </div>
           <div className="mockup-body">
             <div className="mockup-sidebar">
@@ -214,7 +214,7 @@ export default function Landing({ onLogin, onRegister }) {
       {/* ── Final CTA ───────────────────────────────────────────── */}
       <section className="land-cta-section">
         <h2 className="land-cta-h2">Ready to run smarter inventory?</h2>
-        <p className="land-cta-sub">Join retailers already saving hours every week with StockQuery AI.</p>
+        <p className="land-cta-sub">Join retailers already saving hours every week with StockSync.</p>
         <button className="land-btn-primary land-btn-lg" onClick={onRegister}>
           Get Started Free →
         </button>
@@ -224,7 +224,7 @@ export default function Landing({ onLogin, onRegister }) {
       <footer className="land-footer">
         <div className="land-footer-logo">
           <span className="land-logo-icon">◈</span>
-          <span className="land-logo-text">StockQuery AI</span>
+          <span className="land-logo-text">StockSync</span>
         </div>
         <div className="land-footer-links">
           <a href="#features">Features</a>
@@ -232,7 +232,7 @@ export default function Landing({ onLogin, onRegister }) {
           <a href="https://github.com" target="_blank" rel="noreferrer">GitHub</a>
         </div>
         <div className="land-footer-copy">
-          © 2025 StockQuery AI · All rights reserved
+          © 2026 StockSync · All rights reserved
         </div>
       </footer>
     </div>

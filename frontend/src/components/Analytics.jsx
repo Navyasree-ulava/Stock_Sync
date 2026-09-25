@@ -1,4 +1,4 @@
-// Analytics.jsx — StockQuery AI · Business Intelligence Dashboard
+// Analytics.jsx — StockSync · Business Intelligence Dashboard
 import { useState, useEffect } from 'react'
 import axios from 'axios'
 import {
