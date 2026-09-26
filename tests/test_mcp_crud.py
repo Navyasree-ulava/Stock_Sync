@@ -506,6 +506,11 @@ def test_mcp_mutations_are_tenant_scoped(mcp_sessions):
 
 @pytest.fixture
 def routing_mocks(monkeypatch):
+    """
+    Exercises the LEGACY regex-router path (USE_LLM_INTENT disabled), which is
+    still shipped as a fallback. The primary LLM structured-intent path is
+    covered by tests/test_llm_intent.py.
+    """
     tools = [
         {
             "type": "function",
@@ -518,6 +523,7 @@ def routing_mocks(monkeypatch):
         for name in TOOL_NAMES
     ]
     call_tool = AsyncMock()
+    monkeypatch.setattr(agent, "USE_LLM_INTENT", False)
     monkeypatch.setattr(agent.mcp_manager, "get_tools", lambda: tools)
     monkeypatch.setattr(agent.mcp_manager, "call_tool", call_tool)
     monkeypatch.setattr(
@@ -526,6 +532,11 @@ def routing_mocks(monkeypatch):
         lambda: pytest.fail("Deterministic routes must not call the LLM"),
     )
     return call_tool
+
+
+def test_llm_intent_path_is_the_default():
+    """The LLM structured-intent pipeline is what /query uses by default."""
+    assert agent.USE_LLM_INTENT is True
 
 
 @pytest.mark.asyncio

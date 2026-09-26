@@ -230,7 +230,9 @@ The backend loads the repository-root `.env` file.
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `60` | Access-token lifetime |
 | `GROQ_API_KEY` | Required for `/query` | none | Groq API credential |
 | `LLM_MODEL` | No | `openai/gpt-oss-20b` | Overrides the Groq tool-calling model |
-| `LLM_MAX_TURNS` | No | `10` | Maximum model/tool loop iterations |
+| `LLM_MAX_TURNS` | No | `10` | Maximum model/tool loop iterations (legacy path) |
+| `USE_LLM_INTENT` | No | `true` | `false` falls back to the legacy regex router |
+| `LLM_MAX_CLARIFICATIONS` | No | `3` | Follow-up questions before asking the user to restate |
 | `ELEVENLABS_API_KEY` | For TTS | none | ElevenLabs credential |
 | `ELEVENLABS_VOICE_ID` | For TTS | none | ElevenLabs voice ID |
 | `ELEVENLABS_MODEL` | No | `eleven_flash_v2_5` | ElevenLabs speech model |
@@ -322,7 +324,29 @@ The assistant receives these tool schemas from `mcp_server/server.py`:
 12. `update_product` — update one product's stock, price, and/or category together
 13. `delete_product` — delete one verified database row
 
-The backend injects the authenticated user's ID into every tool call. High-confidence create, update, delete, category-list, and search requests are routed to exactly one canonical MCP tool. Their response text and tables are generated from the committed tool result, so IDs, counts, prices, and stock values are not recalculated by the LLM.
+The backend injects the authenticated user's ID into every tool call; the model never sees or supplies it.
+
+### How `/query` works
+
+```
+user text
+  -> LLM emits ONE typed intent (submit_intent)      # no SQL, no ids, no user_id
+  -> deterministic Python validation                 # required fields, ranges, unknown intents
+  -> product resolved from PostgreSQL                # query_inventory_db; ids come from the DB
+  -> exactly ONE MCP action tool
+  -> answer rendered from the committed result
+```
+
+The model only translates language and, when something is required but absent, asks one short
+follow-up question. It never writes SQL, never invents a product id or database value, and never
+authors the final answer text. All numbers in a response come from the committed MCP result.
+
+If the target product is missing or ambiguous the request stops with a question rather than a
+guess. The pending intent, the original request, and the candidate rows are held per user, so a
+short reply such as `1500` or `the 5kg one` completes the original request.
+
+Set `USE_LLM_INTENT=false` to fall back to the legacy regex router, which is still shipped and
+still covered by tests.
 
 ## Data model
 
@@ -344,7 +368,7 @@ python -m pip install pytest pytest-asyncio
 python -m pytest -v
 ```
 
-The repository currently defines 95 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, deterministic routing, fuzzy product-name resolution, intent-boundary rejection, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The automated suite does not perform real LLM or TTS calls; the live Docker workflow verifies those integrations separately. There is currently no frontend test or lint command.
+The repository currently defines 149 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, LLM structured-intent extraction, clarification and resume, ambiguity handling, create-versus-restock, multi-target refusal, legacy routing, fuzzy product-name resolution, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The model is stubbed in the automated suite; everything after extraction, including the MCP tools and the database, is real, and the live Docker workflow exercises the real Groq model. There is currently no frontend test or lint command.
 
 Build the frontend with:
 
@@ -406,7 +430,11 @@ StockSync/
 
 - The Settings page is a visual prototype. Save, account deletion, password change, and product deletion are not persisted by the backend.
 - Logout clears browser storage but does not revoke the JWT before it expires.
-- Chat messages are stored and displayed, but prior messages are not included in future LLM prompts; the assistant has no conversational memory.
+- Chat messages are stored and displayed. The assistant keeps no conversational memory beyond a pending clarification, which is held in process memory and expires after 15 minutes.
+- The pending-clarification store is in-process. With more than one backend replica it must move to shared storage, or a clarification started on one replica will not be visible to another.
+- Product-name ambiguity is resolved from the user's own words only when one candidate is a clear winner; otherwise the assistant asks. It never picks arbitrarily.
+- A request naming several products for one mutation is refused rather than partially applied.
+- The deterministic legacy regex router is retained only as a fallback behind `USE_LLM_INTENT=false`; it is not the default path.
 - Dashboard value and low-stock analytics are calculated in the browser from at most 200 fetched products and are not authoritative for larger inventories.
 - TTS is requested automatically only after a voice-originated question; there is no general replay button.
 - “Clear Session” hides current UI messages but does not delete persisted server history.

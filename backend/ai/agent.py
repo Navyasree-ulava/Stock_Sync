@@ -19,6 +19,19 @@ from pydantic import BaseModel
 
 from mcp_bridge.client_manager import mcp_manager
 
+from .clarification import clarification_store
+from .intent_schema import (
+    INTENT_TOOL,
+    SYSTEM_PROMPT_INTENT,
+    KNOWN_INTENTS,
+    Clarification,
+    IntentPlan,
+    Rejection,
+    build_intent,
+    normalise_product_query,
+    validate_intent,
+)
+
 log = logging.getLogger(__name__)
 
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
@@ -28,6 +41,16 @@ BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 MODEL = os.environ.get("LLM_MODEL", DEFAULT_GROQ_MODEL)
 MAX_TURNS: int = int(os.environ.get("LLM_MAX_TURNS", "10"))
+# When true the LLM produces a typed intent first and Python validates and
+# executes it. Set to "false" to fall back to the legacy regex router.
+USE_LLM_INTENT: bool = os.environ.get("USE_LLM_INTENT", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+)
+# Stop asking follow-up questions after this many rounds so a user who cannot
+# fill the gap gets a clear instruction instead of an endless loop.
+MAX_CLARIFICATIONS: int = int(os.environ.get("LLM_MAX_CLARIFICATIONS", "3"))
 
 PRODUCT_READ_TOOLS = {
     "query_inventory_db",
@@ -604,7 +627,6 @@ async def _execute_routed_request(route: RoutedRequest, user_id: int, tools: lis
         return _routed_failure(route, f"Required MCP tool '{route.tool_name}' is unavailable.")
     if route.validation_error:
         return _routed_failure(route, route.validation_error)
-
     arguments = {key: value for key, value in route.arguments.items() if value is not None}
     arguments["user_id"] = user_id
     log.info(f"[AGENT] Canonical route '{route.tool_name}' args={arguments}")
@@ -683,14 +705,454 @@ async def _execute_routed_request(route: RoutedRequest, user_id: int, tools: lis
     )
 
 
+# ── LLM structured-intent pipeline ────────────────────────────────────────────
+# Flow: user text -> LLM typed intent -> deterministic validation ->
+#       product resolution (DB) -> one MCP action -> verified rendering.
+# The model never produces SQL, product ids, or user_id.
+
+_INTENT_MODEL_MAX_TOKENS = 700
+
+
+def _intent_error(message: str) -> QueryResponse:
+    """A refusal that never touched the database."""
+    return QueryResponse(
+        answer=message,
+        tool_used=None,
+        data=[{"error": message}],
+    )
+
+
+def _clarification_response(question: str, clarification: Clarification) -> QueryResponse:
+    return QueryResponse(
+        answer=clarification.question,
+        tool_used=None,
+        data=[{"needs_clarification": True, "missing": list(clarification.missing)}],
+    )
+
+
+def _build_intent_messages(question: str, pending) -> list[dict]:
+    """
+    Assemble the extraction prompt.
+
+    A pending clarification is folded into the system message together with the
+    original request and the candidate rows, so the model can complete the
+    original intent from a short answer.
+    """
+    system = SYSTEM_PROMPT_INTENT
+    if pending is not None:
+        system += (
+            "\n\nPENDING REQUEST CONTEXT (the user is answering your question; "
+            "combine it and submit the completed intent):\n"
+            + json.dumps(pending.to_context(), default=str)
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": pending.original_question},
+        ]
+        if pending.clarification_question:
+            messages.append({"role": "assistant", "content": pending.clarification_question})
+        messages.append({"role": "user", "content": question})
+        return messages
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": question},
+    ]
+
+
+async def _extract_raw_intent(client: OpenAI, question: str, pending) -> Optional[dict]:
+    """One LLM call. Returns the submit_intent arguments, or None."""
+    messages = _build_intent_messages(question, pending)
+
+    def _call():
+        return client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=[INTENT_TOOL],
+            tool_choice={"type": "function", "function": {"name": "submit_intent"}},
+            parallel_tool_calls=False,
+            max_tokens=_INTENT_MODEL_MAX_TOKENS,
+        )
+
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(None, _call)
+    msg = response.choices[0].message
+
+    if msg.tool_calls:
+        call = msg.tool_calls[0]
+        if call.function.name != "submit_intent":
+            log.warning(f"[INTENT] model called unexpected tool '{call.function.name}'")
+            return None
+        try:
+            raw = json.loads(call.function.arguments)
+        except (json.JSONDecodeError, TypeError):
+            log.warning("[INTENT] submit_intent arguments were not valid JSON")
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    # The model answered in prose instead of calling the tool. Try to recover a
+    # JSON object, otherwise treat it as "I could not work out the request".
+    content = (msg.content or "").strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        if content.lower().startswith("json"):
+            content = content[4:]
+    start, end = content.find("{"), content.rfind("}")
+    if start != -1 and end > start:
+        try:
+            raw = json.loads(content[start:end + 1])
+            if isinstance(raw, dict):
+                return raw
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+async def _resolve_candidates(user_id: int, product_query: str) -> list[dict]:
+    """
+    Look the product up in PostgreSQL through the existing read tool.
+
+    This is the only place a product id is obtained. The model never supplies
+    one, so an invented id is impossible by construction.
+    """
+    result = await mcp_manager.call_tool(
+        "query_inventory_db",
+        {"user_id": user_id, "product_name": product_query},
+    )
+    if isinstance(result, dict) and result.get("error"):
+        return []
+    rows = _normalize_client_rows(result)
+    return [
+        row for row in rows
+        if isinstance(row, dict) and row.get("id") is not None and not row.get("error")
+    ]
+
+
+def _ambiguity_question(plan: IntentPlan, candidates: list[dict]) -> str:
+    """Ask which product, using only names the database actually returned."""
+    verb = {
+        "delete_product": "delete",
+        "update_stock": "change the stock of",
+        "update_product": "change",
+        "get_product_details": "show details for",
+    }.get(plan.intent, "use")
+    names = ", ".join(f"'{c.get('name')}'" for c in candidates[:5])
+    if len(candidates) > 5:
+        names += f", and {len(candidates) - 5} more"
+    return (
+        f"Several products match. Which one should I {verb}? "
+        f"Matches: {names}."
+    )
+
+
+def _narrow_by_user_text(candidates: list[dict], user_text: str) -> Optional[dict]:
+    """
+    Break an ambiguity using only the user's own words.
+
+    The model may under-specify the name ("basmati rice" for a request that
+    actually said "basmati ricce 1kg"). Every candidate name is scored by how
+    many of its own tokens appear in what the user typed. A candidate is only
+    chosen when it is the single clear winner; a tie falls through to a question.
+    """
+    haystack = " ".join(re.findall(r"[a-z0-9]+", (user_text or "").lower()))
+    if not haystack:
+        return None
+    scored = []
+    for candidate in candidates:
+        tokens = [t for t in re.findall(r"[a-z0-9]+", str(candidate.get("name", "")).lower()) if t]
+        if not tokens:
+            continue
+        hits = sum(1 for token in tokens if token in haystack)
+        scored.append((hits / len(tokens), candidate))
+    if len(scored) < 2:
+        return None
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    if scored[0][0] <= scored[1][0]:
+        return None, scored  # type: ignore[return-value]
+    return scored[0][1]
+
+
+async def _execute_intent_plan(plan: IntentPlan, user_id: int, question: str) -> QueryResponse:
+    """Resolve the target if needed, run the single action, render the result."""
+    arguments = dict(plan.arguments)
+    resolved: Optional[dict] = None
+
+    if plan.needs_product:
+        query_text = plan.targets[0] if plan.targets else ""
+        candidates = await _resolve_candidates(user_id, query_text) if query_text else []
+        if not candidates:
+            return _intent_error(
+                f"No product in your inventory matches '{query_text}'. "
+                "Check the name, or list your products to see what is available."
+            )
+        if len(candidates) > 1:
+            narrowed = _narrow_by_user_text(candidates, question)
+            if isinstance(narrowed, dict):
+                log.info(
+                    f"[INTENT] disambiguated by user text -> id={narrowed['id']} "
+                    f"name={narrowed.get('name')!r}"
+                )
+                candidates = [narrowed]
+            else:
+                clarification = Clarification(
+                    question=_ambiguity_question(plan, candidates),
+                    missing=["product_query"],
+                )
+                clarification_store.save_from_clarification(
+                    user_id, question, {"product_queries": plan.targets},
+                    plan.intent, clarification,
+                )
+                pending = clarification_store.get(user_id)
+                if pending is not None:
+                    pending.candidates = candidates
+                    clarification_store.save(user_id, pending)
+                return _clarification_response(question, clarification)
+        resolved = candidates[0]
+        arguments["product_id"] = resolved["id"]
+
+    arguments["user_id"] = user_id
+    log.info(f"[INTENT] executing '{plan.tool_name}' args={_redact(arguments)}")
+    result = await mcp_manager.call_tool(plan.tool_name, arguments)
+
+    if isinstance(result, dict) and result.get("error"):
+        error_text = str(result["error"])
+        if error_text.startswith(("MCP session", "Tool call failed")):
+            raise MCPUnavailableError(f"MCP tool '{plan.tool_name}' failed: {error_text}")
+        return _intent_error(f"{_label(plan)} failed: {error_text}")
+
+    return _render_intent_result(plan, result, resolved)
+
+
+def _redact(arguments: dict) -> dict:
+    """Never log the authenticated user id alongside a tool call."""
+    return {k: v for k, v in arguments.items() if k != "user_id"}
+
+
+def _label(plan: IntentPlan) -> str:
+    mutation = {
+        "create": "Product creation",
+        "update": "Product update",
+        "delete": "Product deletion",
+    }
+    if plan.kind in mutation:
+        return mutation[plan.kind]
+    return {
+        "query_inventory_db": f"'{plan.targets[0]}'" if plan.targets else "your inventory",
+        "get_product_details": f"'{plan.targets[0]}'" if plan.targets else "that product",
+        "get_products_by_category": f"category '{plan.arguments.get('category')}'",
+        "get_products_by_names": "the names you listed",
+        "get_low_stock_items": f"products at or below {plan.arguments.get('threshold')}",
+        "search_inventory": "your search",
+    }.get(plan.intent, "your inventory")
+
+
+def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) -> QueryResponse:
+    """
+    Build the user-facing answer from the committed MCP result only.
+
+    No value in this text comes from the model, so a price or id can never be
+    invented or rescaled.
+    """
+    tool = plan.tool_name
+    label = _label(plan)
+
+    if plan.kind in ("create", "update", "delete"):
+        if not isinstance(result, dict) or result.get("success") is not True or result.get("id") is None:
+            return _intent_error(f"{label} was not confirmed by the database.")
+        if plan.kind == "create":
+            answer = (
+                f"Created '{result['name']}' (ID {result['id']}) in {result['category']} "
+                f"with stock {result['stock']}, price {_format_price(result['price'])}, "
+                f"supplier {result.get('supplier') or 'Unknown'}."
+            )
+        elif plan.kind == "delete":
+            answer = f"Deleted '{result['name']}' (ID {result['id']}) from your inventory."
+        else:
+            if tool == "update_stock":
+                answer = (
+                    f"Updated '{result['name']}' (ID {result['id']}) stock from "
+                    f"{result.get('old_stock')} to {result.get('new_stock')}. "
+                    f"Price remains {_format_price(result.get('price', 0))}."
+                )
+            else:
+                before = result.get("before") or {}
+                changed = []
+                for field in result.get("updated_fields", []):
+                    if field == "stock":
+                        changed.append(f"stock {before.get('stock')} → {result.get('stock')}")
+                    elif field == "price":
+                        changed.append(
+                            f"price {_format_price(before.get('price', 0))}"
+                            f" → {_format_price(result.get('price', 0))}"
+                        )
+                    elif field == "category":
+                        changed.append(
+                            f"category {before.get('category')} → {result.get('category')}"
+                        )
+                summary = "; ".join(changed) if changed else "already had the requested values"
+                answer = f"Updated '{result['name']}' (ID {result['id']}): {summary}."
+        return QueryResponse(answer=answer, tool_used=tool, data=[result])
+
+    # Reads: an empty dict is how get_product_details reports "not found".
+    if tool == "get_product_details":
+        if not isinstance(result, dict) or not result or result.get("error"):
+            return _intent_error("No product matched that request.")
+        return QueryResponse(
+            answer=_format_product_read_response([result], _label(plan)),
+            tool_used=tool,
+            data=[result],
+        )
+
+    rows = _normalize_client_rows(result)
+    if tool == "get_all_categories":
+        categories = [r.get("value", r) if isinstance(r, dict) else r for r in rows]
+        if not categories:
+            return QueryResponse(
+                answer="You have no product categories yet.", tool_used=tool, data=rows,
+            )
+        listing = ", ".join(str(c) for c in categories)
+        return QueryResponse(
+            answer=f"You have {len(categories)} categories: {listing}.",
+            tool_used=tool,
+            data=rows,
+        )
+
+    if tool == "get_inventory_analytics":
+        stats = result if isinstance(result, dict) else {}
+        if not stats or stats.get("total_products", 0) in (0, None):
+            return QueryResponse(
+                answer="Your inventory is empty, so there is nothing to summarise yet.",
+                tool_used=tool,
+                data=rows,
+            )
+        answer = (
+            f"You have {stats.get('total_products')} products "
+            f"({stats.get('total_items')} units in total), "
+            f"total inventory value {_format_price(stats.get('total_inventory_value', 0))}, "
+            f"average price {_format_price(stats.get('average_price', 0))}. "
+            f"Most expensive: {stats.get('most_expensive')}. "
+            f"Cheapest: {stats.get('cheapest')}."
+        )
+        return QueryResponse(answer=answer, tool_used=tool, data=rows)
+
+    if tool == "get_category_analytics":
+        if not rows:
+            return QueryResponse(
+                answer="You have no product categories yet.", tool_used=tool, data=rows,
+            )
+        lines = [
+            f"- {r.get('category')}: {r.get('product_count')} products, "
+            f"{r.get('total_stock')} units, average price "
+            f"{_format_price(r.get('avg_price', 0))}"
+            for r in rows if isinstance(r, dict)
+        ]
+        answer = f"Breakdown across {len(rows)} categories:\n" + "\n".join(lines)
+        return QueryResponse(answer=answer, tool_used=tool, data=rows)
+
+    answer = _format_product_read_response(rows, _label(plan))
+    if not rows and plan.arguments.get("name"):
+        answer = (
+            f"No product in your inventory matches "
+            f"'{plan.arguments['name']}'. Check the name or list your products."
+        )
+    return QueryResponse(answer=answer, tool_used=tool, data=rows)
+
+
+async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> QueryResponse:
+    """Full pipeline: extract -> validate -> resolve -> execute -> render."""
+    available = {t.get("function", {}).get("name") for t in tools}
+    if "query_inventory_db" not in available:
+        raise MCPUnavailableError("Inventory MCP tools are not available.")
+
+    pending = clarification_store.get(user_id)
+    client = _get_openai_client()
+
+    raw = await _extract_raw_intent(client, question, pending)
+    if raw is None:
+        clarification_store.clear(user_id)
+        return _intent_error(
+            "I could not turn that into an inventory action. "
+            "Try naming the product and the change, for example "
+            "'set the price of Widget to 500'."
+        )
+
+    log.info(f"[INTENT] raw={json.dumps(raw, default=str)[:400]}")
+    intent = build_intent(raw, question)
+
+    # Ids this request is allowed to reference: digits the user wrote, plus the
+    # rows this backend already fetched for this user while resolving ambiguity.
+    candidates = list(pending.candidates) if pending is not None else []
+    allowed_ids = {int(c["id"]) for c in candidates if c.get("id") is not None}
+
+    # If the model picked one of the candidates we offered, use that row
+    # directly. This is how a short answer like "the 5kg one" completes an
+    # ambiguous request without a second round trip.
+    if candidates and intent.select_candidate:
+        wanted = intent.select_candidate.strip().lower()
+        for candidate in candidates:
+            if str(candidate.get("name", "")).strip().lower() == wanted:
+                intent.product_id = int(candidate["id"])
+                intent.product_queries = [str(candidate.get("name"))]
+                log.info(f"[INTENT] candidate selected id={candidate['id']}")
+                break
+        else:
+            return _intent_error(
+                "I could not tell which of the listed products you meant. "
+                "Please repeat the full product name."
+            )
+
+    outcome = validate_intent(intent, question, allowed_ids=allowed_ids)
+
+    if isinstance(outcome, Rejection):
+        clarification_store.clear(user_id)
+        return _intent_error(outcome.message)
+
+    if isinstance(outcome, Clarification):
+        attempts = pending.attempts if pending is not None else 0
+        if attempts >= MAX_CLARIFICATIONS:
+            clarification_store.clear(user_id)
+            return _intent_error(
+                "I still need a detail before I can continue. "
+                "Please restate the request with the product name and the value to change."
+            )
+        clarification_store.save_from_clarification(
+            user_id, pending.original_question if pending else question,
+            raw, intent.intent, outcome,
+        )
+        return _clarification_response(question, outcome)
+
+    if outcome.tool_name not in available:
+        clarification_store.clear(user_id)
+        return _intent_error(f"Required MCP tool '{outcome.tool_name}' is unavailable.")
+
+    log.info(f"[INTENT] plan='{outcome.intent}' tool='{outcome.tool_name}' "
+             f"targets={outcome.targets} args={_redact(outcome.arguments)}")
+
+    response = await _execute_intent_plan(outcome, user_id, question)
+    # A resolved plan means the request is settled; drop the pending state.
+    if not (response.data and isinstance(response.data[0], dict)
+            and response.data[0].get("needs_clarification")):
+        clarification_store.clear(user_id)
+    return response
+
+
 async def run_query(question: str, current_user: dict) -> QueryResponse:
-    """Execute one canonical routed request or the general Groq agent loop."""
+    """
+    Execute one inventory request.
+
+    Primary path: the LLM emits a typed intent, Python validates it, the target
+    is resolved from PostgreSQL, one MCP tool runs, and the answer is rendered
+    from the committed result. With USE_LLM_INTENT disabled this falls back to
+    the legacy regex router plus the general Groq tool loop.
+    """
     user_id = current_user["id"]
     log.info(f"[AGENT] Query from user_id={user_id}: {question!r}")
 
     tools = mcp_manager.get_tools()
     if not tools:
         raise MCPUnavailableError("Inventory MCP tools are not available.")
+
+    if USE_LLM_INTENT:
+        return await _run_llm_intent(question, user_id, tools)
 
     routed = route_inventory_request(question)
     if routed is not None:
