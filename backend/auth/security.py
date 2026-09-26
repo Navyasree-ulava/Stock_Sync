@@ -46,8 +46,13 @@ def verify_password(plain: str, hashed: str) -> bool:
 def validate_password_strength(password: str) -> None:
     """
     Raise HTTPException if password does not meet minimum requirements.
-    Rules: ≥8 chars, at least one digit, at least one letter.
+    Rules: ≥8 characters, at least one digit/letter, and ≤72 UTF-8 bytes for bcrypt.
     """
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Password must be at most 72 UTF-8 bytes.",
+        )
     if len(password) < 8:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -95,8 +100,14 @@ def decode_access_token(token: str) -> dict:
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
+        subject = payload.get("sub")
+        if subject is None:
+            raise credentials_exc
+        try:
+            user_id = int(subject)
+        except (TypeError, ValueError):
+            raise credentials_exc
+        if user_id <= 0:
             raise credentials_exc
         return payload
     except jwt.ExpiredSignatureError:

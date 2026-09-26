@@ -1,5 +1,5 @@
 """
-tests/test_integration.py — Integration tests for the FastAPI backend.
+tests/test_integration.py â€” Integration tests for the FastAPI backend.
 
 Uses an in-memory SQLite engine via SQLAlchemy and overrides the DB
 dependency so no real PostgreSQL connection is needed.
@@ -19,7 +19,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-# ── Path & env bootstrap (must happen before any app import) ──
+# â”€â”€ Path & env bootstrap (must happen before any app import) â”€â”€
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["RATELIMIT_ENABLED"] = "false"   # disable slowapi in all test routes
@@ -33,8 +33,9 @@ from fastapi.testclient import TestClient
 
 from db.models import Base
 from db.connection import get_db
+from mcp_bridge.client_manager import mcp_manager
 
-# ── Shared in-memory engine ───────────────────────────────────
+# â”€â”€ Shared in-memory engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _engine = create_engine(
     "sqlite:///:memory:",
     connect_args={"check_same_thread": False},
@@ -57,7 +58,7 @@ def _override_get_db():
         db.close()
 
 
-# ── App import + patch MCP ───────────────────────────────────
+# â”€â”€ App import + patch MCP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 with patch("mcp_bridge.client_manager.MCPManager.start", new_callable=AsyncMock), \
      patch("mcp_bridge.client_manager.MCPManager.stop", new_callable=AsyncMock), \
      patch("mcp_bridge.client_manager.MCPManager.get_tools", return_value=[]):
@@ -70,23 +71,37 @@ import uuid
 app.state.limiter._key_func = lambda request: str(uuid.uuid4())
 
 
-# ── Fixtures ──────────────────────────────────────────────────
+# â”€â”€ Fixtures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
-        yield c
+    fake_tool = {
+        "type": "function",
+        "function": {
+            "name": "query_inventory_db",
+            "description": "Test inventory tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    with patch.object(mcp_manager, "start", new_callable=AsyncMock), \
+         patch.object(mcp_manager, "stop", new_callable=AsyncMock), \
+         patch.object(mcp_manager, "get_tools", return_value=[fake_tool]):
+        with TestClient(app) as test_client:
+            yield test_client
 
 
 def _register_and_login(client, full_name, email, password="Password1"):
-    client.post("/auth/register", json={
+    register_resp = client.post("/auth/register", json={
         "full_name": full_name,
         "email": email,
         "password": password,
         "business_name": "Apex Retailers LLC"
     })
+    assert register_resp.status_code in (201, 409), register_resp.text
     resp = client.post("/auth/login", json={"email": email, "password": password})
+    assert resp.status_code == 200, resp.text
     token = resp.json().get("access_token", "")
+    assert token
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -95,7 +110,7 @@ def auth_headers(client):
     return _register_and_login(client, "integtest", "integtest@example.com")
 
 
-# ── Auth ──────────────────────────────────────────────────────
+# â”€â”€ Auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestAuth:
     def test_register_returns_201(self, client):
@@ -106,7 +121,10 @@ class TestAuth:
             "business_name": " Apex Corp"
         })
         assert resp.status_code == 201
-        assert resp.json() == {"message": "User created successfully"}
+        body = resp.json()
+        assert body["token_type"] == "bearer"
+        assert body["access_token"]
+        assert body["user"]["email"] == "newuser@test.com"
 
     def test_duplicate_register_returns_409(self, client):
         client.post("/auth/register", json={
@@ -160,7 +178,7 @@ class TestAuth:
         assert resp.json() == {"message": "Logged out successfully"}
 
 
-# ── JWT Protection ────────────────────────────────────────────
+# â”€â”€ JWT Protection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestJWTProtection:
     def test_query_without_token_returns_401(self, client):
@@ -184,7 +202,7 @@ class TestJWTProtection:
         assert resp.status_code == 401
 
 
-# ── /users/me ─────────────────────────────────────────────────
+# â”€â”€ /users/me â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestUsersMe:
     def test_me_returns_profile(self, client, auth_headers):
@@ -197,7 +215,7 @@ class TestUsersMe:
         assert "id" in body
 
 
-# ── Inventory CRUD ────────────────────────────────────────────
+# â”€â”€ Inventory CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestInventory:
     def _create_product(self, client, auth_headers, name="Test Widget", category="Tools", stock=50, price=9.99, supplier="SupplierA"):
@@ -373,9 +391,37 @@ class TestInventory:
         assert "Old Item" not in p_names
         assert "Brand New Item" in p_names
 
+    def test_import_auto_detects_stock_and_defaults_supplier(self, client, auth_headers):
+        csv_data = "Product Name,Stock Quantity\nMapped Widget,9\n"
+        resp = client.post(
+            "/inventory/import",
+            headers=auth_headers,
+            files={"file": ("minimal.csv", csv_data, "text/csv")},
+            data={"strategy": "replace_all", "mappings": '{"name": "Product Name"}'},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["inserted"] == 1
+
+        products = client.get("/inventory/products?search=Mapped+Widget", headers=auth_headers).json()["products"]
+        assert len(products) == 1
+        assert products[0]["stock"] == 9
+        assert products[0]["supplier"] == "Unknown"
+
+    def test_invalid_replace_all_preserves_existing_inventory(self, client, auth_headers):
+        self._create_product(client, auth_headers, "Must Survive")
+        csv_data = "Product Name,Stock Quantity\n,4\n"
+        resp = client.post(
+            "/inventory/import",
+            headers=auth_headers,
+            files={"file": ("invalid.csv", csv_data, "text/csv")},
+            data={"strategy": "replace_all", "mappings": '{"name": "Product Name"}'},
+        )
+        assert resp.status_code == 422
+        products = client.get("/inventory/products?search=Must+Survive", headers=auth_headers).json()["products"]
+        assert len(products) == 1
 
 
-# ── Chat History ──────────────────────────────────────────────
+# â”€â”€ Chat History â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestHistory:
     def test_get_empty_history(self, client, auth_headers):
@@ -429,7 +475,7 @@ class TestHistory:
         assert "User A secret message" not in contents
 
 
-# ── Health ────────────────────────────────────────────────────
+# â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestHealth:
     def test_health_returns_ok(self, client):
@@ -438,10 +484,11 @@ class TestHealth:
         body = resp.json()
         assert body["status"] == "ok"
         assert body["service"] == "StockSync"
-        assert body["database"] == "postgresql"
+        assert body["database"] == "ok"
+        assert body["mcp"] == "ok"
 
 
-# ── Typo Tolerance and Fuzzy Queries ──────────────────────────
+# â”€â”€ Typo Tolerance and Fuzzy Queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestFuzzyTypoTolerance:
     def test_fuzzy_matching_on_typos(self):
@@ -481,7 +528,7 @@ class TestFuzzyTypoTolerance:
             db.close()
 
 
-# ── Empty Inventory Queries ───────────────────────────────────
+# â”€â”€ Empty Inventory Queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestEmptyInventoryQueries:
     def test_search_on_empty_database(self, client):
@@ -507,7 +554,7 @@ class TestEmptyInventoryQueries:
         assert resp.json()["products"] == []
 
 
-# ── Import Failures ───────────────────────────────────────────
+# â”€â”€ Import Failures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestImportFailures:
     def test_missing_required_name_mapping(self, client, auth_headers):
@@ -532,7 +579,7 @@ class TestImportFailures:
         assert "parse" in resp.json()["detail"].lower()
 
 
-# ── Search Pagination ──────────────────────────────────────────
+# â”€â”€ Search Pagination â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestSearchPagination:
     def test_search_limit_and_offset(self):
@@ -569,4 +616,88 @@ class TestSearchPagination:
                 assert res2[0]["name"] == "Product 2"
                 assert res2[1]["name"] == "Product 3"
         finally:
+            db.close()
+
+
+class TestLikeWildcardEscaping:
+    """Regression: REST search treated % and _ as SQL wildcards."""
+
+    def test_search_and_category_treat_wildcards_literally(self, client, auth_headers):
+        client.post("/inventory/products", headers=auth_headers, json={
+            "name": "Alpha", "category": "Tools", "stock": 1, "price": 1.0,
+        })
+        client.post("/inventory/products", headers=auth_headers, json={
+            "name": "Beta", "category": "Grains", "stock": 1, "price": 2.0,
+        })
+        client.post("/inventory/products", headers=auth_headers, json={
+            "name": "Under_score", "category": "Odd_Name", "stock": 1, "price": 3.0,
+        })
+
+        # '%' and '_' must match themselves, so every hit must literally
+        # contain that character. auth_headers is module-scoped, so assert the
+        # invariant rather than an exact count.
+        pct = client.get("/inventory/products", headers=auth_headers,
+                         params={"search": "%"}).json()
+        assert all("%" in p["name"] for p in pct["products"]), pct["products"]
+
+        und = client.get("/inventory/products", headers=auth_headers,
+                         params={"search": "_"}).json()
+        assert all("_" in p["name"] for p in und["products"]), und["products"]
+
+        cat = client.get("/inventory/products", headers=auth_headers,
+                         params={"category": "%"}).json()
+        assert all("%" in p["category"] for p in cat["products"]), cat["products"]
+
+        # A real substring still matches.
+        hit = client.get("/inventory/products", headers=auth_headers,
+                         params={"search": "lph"}).json()
+        assert any(p["name"] == "Alpha" for p in hit["products"])
+
+    def test_literal_percent_in_name_is_findable(self, client, auth_headers):
+        client.post("/inventory/products", headers=auth_headers, json={
+            "name": "50% Off", "category": "Sales", "stock": 1, "price": 1.0,
+        })
+        resp = client.get("/inventory/products", headers=auth_headers,
+                          params={"search": "50%"})
+        assert any(p["name"] == "50% Off" for p in resp.json()["products"])
+
+
+class TestAuditLogTenantIsolation:
+    """Regression: the audit outer join leaked another user's product name."""
+
+    def test_audit_rows_cannot_expose_another_tenants_product(self, client, auth_headers):
+        db = _Session()
+        try:
+            from db.models import Product, StockAuditLog, User
+            user_a = db.query(User).filter(User.email == "integtest@example.com").first()
+            assert user_a is not None
+            user_b = db.query(User).filter(User.email == "audit-b@example.com").first()
+            if user_b is None:
+                user_b = User(full_name="Audit B", email="audit-b@example.com", hashed_password="h")
+                db.add(user_b)
+                db.commit()
+            secret = Product(user_id=user_b.id, name="Secret Item",
+                             category="Confidential", stock=7, price=999.0)
+            db.add(secret)
+            db.commit()
+            # A malformed audit row owned by A but pointing at B's product.
+            db.add(StockAuditLog(user_id=user_a.id, product_id=secret.id,
+                                 old_stock=5, new_stock=6, action="rogue"))
+            db.commit()
+            secret_id = secret.id
+
+            resp = client.get("/inventory/audit", headers=auth_headers)
+            assert resp.status_code == 200
+            entries = resp.json()["entries"]
+            # The row is user A's own audit entry, so it may be listed, but it
+            # must not resolve to user B's product name or category.
+            rogue = [e for e in entries if e["product_id"] == secret_id]
+            for entry in rogue:
+                assert entry["product_name"] == "(deleted product)"
+                assert entry["category"] == ""
+            blob = str(resp.json())
+            assert "Secret Item" not in blob
+            assert "Confidential" not in blob
+        finally:
+            db.rollback()
             db.close()

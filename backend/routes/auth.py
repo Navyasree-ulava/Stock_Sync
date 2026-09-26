@@ -2,7 +2,7 @@
 routes/auth.py — Registration, JSON login, and logout endpoints.
 
 All authentication APIs accept JSON payloads. Password validation is enforced.
-New user registration automatically seeds a standard set of default products.
+New accounts start with an isolated, empty inventory.
 """
 
 import logging
@@ -22,8 +22,7 @@ from auth.security import (
 )
 from auth.dependencies import CurrentUser
 from db.connection import get_db
-from db.models import User, Product
-from seed_db import BUILTIN_PRODUCTS
+from db.models import User
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -69,17 +68,14 @@ class Token(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/register", status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
 async def register(
     request: Request,
     user_data: UserCreate,
     db: Annotated[Session, Depends(get_db)],
 ):
-    """
-    Register a new user. Rate limited to 5 attempts/minute per IP.
-    Automatically seeds a default catalog of products upon creation.
-    """
+    """Register a new isolated account and return a usable access token."""
     validate_password_strength(user_data.password)
 
     email_lower = user_data.email.lower()
@@ -104,10 +100,19 @@ async def register(
     
     log.info(f"[AUTH] New user registered: email='{new_user.email}' id={new_user.id}")
 
-    # Seeding is disabled so that new accounts start with an empty dashboard
     log.info(f"[AUTH] Account created with empty inventory for user_id={new_user.id}")
 
-    return {"message": "User created successfully"}
+    user_out = UserOut(
+        id=new_user.id,
+        full_name=new_user.full_name,
+        email=new_user.email,
+        business_name=new_user.business_name,
+    )
+    return {
+        "access_token": create_access_token(user_id=new_user.id, email=new_user.email),
+        "token_type": "bearer",
+        "user": user_out,
+    }
 
 
 @router.post("/login", response_model=Token)
@@ -131,6 +136,12 @@ async def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials.",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is disabled.",
         )
 
     token = create_access_token(user_id=user.id, email=user.email)

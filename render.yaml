@@ -18,10 +18,14 @@ services:
         value: "60"
       - key: GROQ_API_KEY
         sync: false                  # Set manually in Render dashboard
+      - key: LLM_MODEL
+        value: "openai/gpt-oss-20b"
       - key: ELEVENLABS_API_KEY
         sync: false                  # Optional — set manually in Render dashboard
       - key: ELEVENLABS_VOICE_ID
-        value: "21m00Tcm4TlvDq8ikWAM"
+        sync: false                  # Set your ElevenLabs voice ID
+      - key: ELEVENLABS_MODEL
+        value: "eleven_flash_v2_5"
       - key: ALLOWED_ORIGINS
         sync: false                  # Set to your Vercel frontend URL after deploy
 

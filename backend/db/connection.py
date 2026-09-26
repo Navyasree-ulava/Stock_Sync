@@ -6,9 +6,14 @@ Supports both PostgreSQL (production) and SQLite in-memory (tests).
 """
 
 import os
+from pathlib import Path
 from typing import Generator
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",

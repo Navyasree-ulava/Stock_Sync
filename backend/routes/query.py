@@ -13,6 +13,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
+from openai import APIConnectionError, AuthenticationError, NotFoundError, RateLimitError
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
@@ -20,7 +21,7 @@ from sqlalchemy.orm import Session
 from auth.dependencies import CurrentUser
 from db.connection import get_db
 from db.models import ChatHistory
-from ai.agent import run_query, QueryResponse
+from ai.agent import AIConfigurationError, MCPUnavailableError, QueryResponse, run_query
 
 from sqlalchemy import select
 
@@ -107,13 +108,22 @@ async def query_inventory(
 
     try:
         result = await run_query(question=question, current_user=current_user)
-    except Exception as e:
-        err = str(e)
-        log.error(f"[QUERY] Failed for user_id={current_user['id']}: {err}", exc_info=True)
-        if "401" in err or "Unauthorized" in err:
-            raise HTTPException(status_code=503, detail="AI service authentication failed. Check GROQ_API_KEY.")
-        if "429" in err:
-            raise HTTPException(status_code=429, detail="AI service rate limit reached. Please wait and retry.")
+    except AuthenticationError as exc:
+        log.error("[QUERY] Groq authentication failed", exc_info=True)
+        raise HTTPException(status_code=503, detail="AI service authentication failed. Check GROQ_API_KEY.")
+    except NotFoundError as exc:
+        log.error("[QUERY] Configured Groq model is unavailable", exc_info=True)
+        raise HTTPException(status_code=503, detail="The configured AI model is unavailable. Check LLM_MODEL.")
+    except RateLimitError:
+        raise HTTPException(status_code=429, detail="AI service rate limit reached. Please wait and retry.")
+    except (APIConnectionError, AIConfigurationError):
+        log.error("[QUERY] AI provider is unavailable", exc_info=True)
+        raise HTTPException(status_code=503, detail="AI service is not configured or currently unavailable.")
+    except MCPUnavailableError:
+        log.error("[QUERY] Inventory MCP service is unavailable", exc_info=True)
+        raise HTTPException(status_code=503, detail="Inventory assistant is temporarily unavailable. Please try again.")
+    except Exception:
+        log.exception(f"[QUERY] Failed for user_id={current_user['id']}")
         raise HTTPException(status_code=500, detail="Query failed. Please try again.")
 
     # Persist both sides of the exchange

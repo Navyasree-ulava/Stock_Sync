@@ -8,9 +8,11 @@ All operations are user_id scoped — no cross-user data leakage.
 from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
+import asyncio
 import io
 import logging
 import json
+import math
 from pydantic import BaseModel, field_validator
 
 from auth.dependencies import CurrentUser
@@ -18,11 +20,18 @@ from db.connection import get_db
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, distinct, or_
-from db.models import Product, StockAuditLog
+from db.models import Product, StockAuditLog, User
 from utils.import_parser import parse_file_rows, resolve_column_headers, validate_row, detect_dataset_type
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/inventory", tags=["inventory"])
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_IMPORT_ROWS = 5_000
+
+
+def _escape_like(value: str) -> str:
+    """Treat %, _ and \\ in user input as literal characters, not wildcards."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 # ── Pydantic Models ────────────────────────────────────────────────────────────
 
@@ -56,8 +65,8 @@ class ProductIngest(BaseModel):
     @field_validator("price")
     @classmethod
     def price_non_negative(cls, v: float) -> float:
-        if v < 0:
-            raise ValueError("Price cannot be negative.")
+        if not math.isfinite(v) or v < 0:
+            raise ValueError("Price must be a finite, non-negative number.")
         return round(v, 2)
 
     @field_validator("supplier")
@@ -154,14 +163,26 @@ async def preview_import(
             detail="Unsupported file format. Please upload a .csv or .xlsx file."
         )
 
+    content_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Upload exceeds the 50 MB limit.",
+        )
+
     try:
-        content_bytes = await file.read()
-        headers, raw_rows = parse_file_rows(content_bytes, filename)
+        headers, raw_rows = await asyncio.to_thread(parse_file_rows, content_bytes, filename)
     except Exception as parse_err:
         log.error(f"[IMPORT] File parsing failed for {filename}: {parse_err}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to parse file: {str(parse_err)}"
+        )
+
+    if len(raw_rows) > MAX_IMPORT_ROWS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Imports are limited to {MAX_IMPORT_ROWS:,} rows.",
         )
 
     column_mappings = resolve_column_headers(headers)
@@ -207,7 +228,28 @@ async def execute_import(
             detail="Mappings must be a valid JSON string."
         )
 
-    if not mappings_dict.get("name"):
+    if not isinstance(mappings_dict, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Mappings must be a JSON object."
+        )
+
+    allowed_mapping_fields = {"name", "category", "stock", "price", "supplier"}
+    unknown_mapping_fields = set(mappings_dict) - allowed_mapping_fields
+    if unknown_mapping_fields:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown mapping field(s): {', '.join(sorted(unknown_mapping_fields))}."
+        )
+
+    # Empty optional selections mean auto-detection should remain in effect.
+    provided_mappings = {
+        field: header
+        for field, header in mappings_dict.items()
+        if isinstance(header, str) and header.strip()
+    }
+
+    if not provided_mappings.get("name"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Mapping for 'name' is mandatory."
@@ -219,11 +261,24 @@ async def execute_import(
             detail="Invalid duplicate strategy. Supported: 'skip', 'update', 'replace_all'."
         )
 
-    # 2. Parse file
+    # 2. Parse and validate the uploaded file before changing the database.
     filename = file.filename or "file.csv"
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if extension not in ("csv", "xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file format. Please upload a .csv or .xlsx file."
+        )
+
+    content_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Upload exceeds the 50 MB limit.",
+        )
+
     try:
-        content_bytes = await file.read()
-        headers, raw_rows = parse_file_rows(content_bytes, filename)
+        headers, raw_rows = await asyncio.to_thread(parse_file_rows, content_bytes, filename)
     except Exception as parse_err:
         log.error(f"[IMPORT] File parsing failed during import for {filename}: {parse_err}")
         raise HTTPException(
@@ -231,91 +286,134 @@ async def execute_import(
             detail=f"Failed to parse file: {str(parse_err)}"
         )
 
-    # Detect dataset type to apply appropriate loading defaults
+    if len(raw_rows) > MAX_IMPORT_ROWS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Imports are limited to {MAX_IMPORT_ROWS:,} rows.",
+        )
+
+    if not headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file does not contain a header row."
+        )
+    if not raw_rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file does not contain any data rows."
+        )
+
+    missing_mapped_headers = sorted({
+        header for header in provided_mappings.values() if header not in headers
+    })
+    if missing_mapped_headers:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Mapped column(s) not found in file: {', '.join(missing_mapped_headers)}."
+        )
+
+    # Preserve automatically detected optional columns unless the user supplied
+    # an explicit replacement mapping.
     resolved_headers_map = resolve_column_headers(headers)
-    # Use resolved mapping merged with user's overrides to classify
-    effective_mappings = {**resolved_headers_map, **mappings_dict}
-    dataset_type, confidence = detect_dataset_type(headers, effective_mappings)
+    effective_mappings = {**resolved_headers_map, **provided_mappings}
+    dataset_type, _confidence = detect_dataset_type(headers, effective_mappings)
 
     user_id = current_user["id"]
-
-    # 3. Apply replace_all strategy by dropping existing records first
-    if strategy == "replace_all":
-        log.info(f"[IMPORT] replace_all strategy triggered: clearing current inventory for user_id={user_id}")
-        db.query(Product).filter(Product.user_id == user_id).delete()
-        db.commit()
-
-    # 4. Fetch existing database entries to evaluate conflicts
-    existing_products = db.query(Product).filter(Product.user_id == user_id).all()
-    existing_map = {p.name.lower().strip(): p for p in existing_products}
-
-    # 5. Process all rows & validate
     valid_prods = []
     failed_rows = []
     failed_count = 0
 
+    # Validate every row before a replace_all deletion or any insert/update.
     for idx, row in enumerate(raw_rows):
-        val_prod, err = validate_row(row, mappings_dict, idx + 1)
+        val_prod, err = validate_row(row, effective_mappings, idx + 1)
         if err:
+            failed_count += 1
             if len(failed_rows) < 5:
                 log.warning(f"[IMPORT] Row {idx + 1} validation failed. Errors: {err.get('errors')}. Row: {row}")
-            failed_rows.append(err)
-            failed_count += 1
+                failed_rows.append(err)
             continue
 
-        # If it is classified as a transaction log or catalog, override stock value to 0
         if dataset_type in ("transaction", "catalog"):
             val_prod["stock"] = 0
 
         valid_prods.append(val_prod)
 
-    # 6. De-duplicate product names case-insensitively for catalogs/transactions
+    if not valid_prods:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No valid inventory rows were found. Existing inventory was not changed."
+        )
+
+    # De-duplicate product names case-insensitively for catalogs/transactions.
     if dataset_type in ("transaction", "catalog"):
         seen_names = {}
         for vp in valid_prods:
             name_key = vp["name"].lower().strip()
-            if name_key not in seen_names:
-                seen_names[name_key] = vp
+            seen_names.setdefault(name_key, vp)
         valid_prods = list(seen_names.values())
 
     inserted_count = 0
     updated_count = 0
     skipped_count = 0
 
-    # 7. Write unique records to database
-    for val_prod in valid_prods:
-        name_key = val_prod["name"].lower().strip()
-        
-        if name_key in existing_map:
-            if strategy == "skip":
-                skipped_count += 1
-            elif strategy == "update":
-                p = existing_map[name_key]
-                p.stock = val_prod["stock"]
-                p.price = val_prod["price"]
-                p.category = val_prod["category"]
-                p.supplier = val_prod["supplier"]
-                updated_count += 1
-        else:
-            # Create new product record
-            new_p = Product(
-                user_id=user_id,
-                name=val_prod["name"],
-                category=val_prod["category"],
-                stock=val_prod["stock"],
-                price=val_prod["price"],
-                supplier=val_prod["supplier"]
-            )
-            db.add(new_p)
-            # Cache locally to handle duplicate entries within the list
-            existing_map[name_key] = new_p
-            inserted_count += 1
+    try:
+        # Serialize imports for this tenant so concurrent conflict strategies
+        # cannot both observe the same "missing" product.
+        db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
-    db.commit()
-    log.info(f"[IMPORT] Scoped user_id={user_id} processed {len(raw_rows)} rows. Result: {inserted_count} inserted, {updated_count} updated, {skipped_count} skipped.")
+        if strategy == "replace_all":
+            # Deletion and insertion share one transaction. If any insert fails,
+            # rollback restores the user's previous inventory.
+            log.info(f"[IMPORT] replace_all strategy: replacing inventory for user_id={user_id}")
+            db.query(Product).filter(Product.user_id == user_id).delete()
+            existing_map = {}
+        else:
+            existing_products = db.query(Product).filter(Product.user_id == user_id).all()
+            existing_map = {p.name.lower().strip(): p for p in existing_products}
+
+        for val_prod in valid_prods:
+            name_key = val_prod["name"].lower().strip()
+
+            if name_key in existing_map:
+                if strategy == "skip":
+                    skipped_count += 1
+                elif strategy == "update":
+                    product = existing_map[name_key]
+                    product.stock = val_prod["stock"]
+                    product.price = val_prod["price"]
+                    product.category = val_prod["category"]
+                    product.supplier = val_prod["supplier"]
+                    updated_count += 1
+            else:
+                new_product = Product(
+                    user_id=user_id,
+                    name=val_prod["name"],
+                    category=val_prod["category"],
+                    stock=val_prod["stock"],
+                    price=val_prod["price"],
+                    supplier=val_prod["supplier"],
+                )
+                db.add(new_product)
+                existing_map[name_key] = new_product
+                inserted_count += 1
+
+        db.flush()
+        db.commit()
+    except Exception as db_error:
+        db.rollback()
+        log.error(f"[IMPORT] Transaction failed for user_id={user_id}: {db_error}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Inventory import failed. No changes were saved."
+        )
+
+    log.info(
+        f"[IMPORT] Scoped user_id={user_id} processed {len(raw_rows)} rows. "
+        f"Result: {inserted_count} inserted, {updated_count} updated, {skipped_count} skipped."
+    )
 
     return {
-        "status": "success",
+        "status": "partial_success" if failed_count else "success",
         "dataset_type": dataset_type,
         "total_rows": len(raw_rows),
         "unique_products": len(valid_prods),
@@ -323,7 +421,7 @@ async def execute_import(
         "updated": updated_count,
         "skipped": skipped_count,
         "failed": failed_count,
-        "failed_rows": failed_rows
+        "failed_rows": failed_rows,
     }
 
 
@@ -385,6 +483,20 @@ class ProductUpdate(BaseModel):
             return v[:200]
         return v
 
+    @field_validator("category")
+    @classmethod
+    def category_sanitize(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return (v.strip() or "General")[:100]
+
+    @field_validator("supplier")
+    @classmethod
+    def supplier_sanitize(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return (v.strip() or "Unknown")[:255]
+
     @field_validator("stock")
     @classmethod
     def stock_non_negative(cls, v: Optional[int]) -> Optional[int]:
@@ -395,8 +507,8 @@ class ProductUpdate(BaseModel):
     @field_validator("price")
     @classmethod
     def price_non_negative(cls, v: Optional[float]) -> Optional[float]:
-        if v is not None and v < 0:
-            raise ValueError("Price cannot be negative.")
+        if v is not None and (not math.isfinite(v) or v < 0):
+            raise ValueError("Price must be a finite, non-negative number.")
         return round(v, 2) if v is not None else v
 
 
@@ -415,15 +527,19 @@ async def list_products(
     """
     user_id = current_user["id"]
     page = max(1, page)
-    per_page = min(per_page, 200)
+    per_page = max(1, min(per_page, 200))
     offset = (page - 1) * per_page
 
     query = db.query(Product).filter(Product.user_id == user_id)
 
     if search.strip():
-        query = query.filter(Product.name.ilike(f"%{search.strip()}%"))
+        query = query.filter(
+            Product.name.ilike(f"%{_escape_like(search.strip())}%", escape="\\")
+        )
     if category.strip():
-        query = query.filter(Product.category.ilike(f"%{category.strip()}%"))
+        query = query.filter(
+            Product.category.ilike(f"%{_escape_like(category.strip())}%", escape="\\")
+        )
 
     total = query.count()
     products = query.order_by(Product.name.asc()).offset(offset).limit(per_page).all()
@@ -575,12 +691,14 @@ async def get_audit_log(
     """
     user_id = current_user["id"]
     page = max(1, page)
-    per_page = min(per_page, 100)
+    per_page = max(1, min(per_page, 100))
     offset = (page - 1) * per_page
 
     total = db.query(StockAuditLog).filter(StockAuditLog.user_id == user_id).count()
 
-    # Outer join to product to get name
+    # Outer join to product to get name. The tenant predicate is part of the
+    # join condition so a malformed audit row can never surface another
+    # user's product name or category.
     rows = db.query(
         StockAuditLog.id,
         StockAuditLog.product_id,
@@ -591,7 +709,9 @@ async def get_audit_log(
         StockAuditLog.action,
         StockAuditLog.created_at
     ).select_from(StockAuditLog).join(
-        Product, Product.id == StockAuditLog.product_id, isouter=True
+        Product,
+        (Product.id == StockAuditLog.product_id) & (Product.user_id == user_id),
+        isouter=True,
     ).filter(
         StockAuditLog.user_id == user_id
     ).order_by(

@@ -34,15 +34,16 @@ def run_migrations(engine: Engine) -> None:
                     log.info("[DB] Migrating: Adding 'business_name' column to 'users' table")
                     conn.execute(text("ALTER TABLE users ADD COLUMN business_name VARCHAR(255)"))
                 
-                # 3. Drop username if present
+                # 3. Preserve a legacy username, then drop the obsolete column.
                 if "username" in columns:
+                    conn.execute(text(
+                        "UPDATE users SET full_name = COALESCE(NULLIF(full_name, ''), username)"
+                    ))
                     log.info("[DB] Migrating: Dropping obsolete 'username' column from 'users' table")
-                    try:
-                        conn.execute(text("ALTER TABLE users DROP COLUMN username"))
-                    except Exception as drop_err:
-                        log.warning(f"[DB] Drop username column failed (may not be supported on this SQLite version): {drop_err}")
-                        
+                    conn.execute(text("ALTER TABLE users DROP COLUMN username"))
+
     except Exception as e:
         log.error(f"[DB] Migration helper failed: {e}", exc_info=True)
+        raise
 
     log.info("[DB] Schema migrations complete.")

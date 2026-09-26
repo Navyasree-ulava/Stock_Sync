@@ -11,7 +11,11 @@ export default function DataTable({ data }) {
     ? data.map(item => ({ Category: item }))
     : data;
 
-  const columns = Object.keys(normalizedData[0]).filter(k => !exclude.has(k))
+  const columns = Object.keys(normalizedData[0])
+    .filter(k => !exclude.has(k))
+    // A column that is an object/array in every row cannot be rendered as a
+    // cell value; skip it rather than showing a placeholder column.
+    .filter(k => !normalizedData.every(row => row[k] !== null && typeof row[k] === 'object'))
 
   const formatCell = (key, val) => {
     if (key === 'stock') {
@@ -23,7 +27,14 @@ export default function DataTable({ data }) {
       )
     }
     if (key === 'price') return `₹${Number(val).toFixed(2)}`
-    return val ?? '—'
+    if (val === null || val === undefined) return '—'
+    // Nested objects/arrays are not valid React children. Render a stable
+    // summary instead of throwing and unmounting the whole chat view.
+    if (typeof val === 'object') {
+      if (Array.isArray(val)) return `${val.length} item${val.length === 1 ? '' : 's'}`
+      return Object.keys(val).length ? JSON.stringify(val) : '—'
+    }
+    return String(val)
   }
 
   return (

@@ -101,10 +101,10 @@ export default function Sidebar({ activeNav, setActiveNav, onQuery, sidebarOpen,
           <>
             <div className="sidebar-user">
               <div className="user-avatar">
-                {(currentUser.username || currentUser.email || 'U')[0].toUpperCase()}
+                {(currentUser.full_name || currentUser.username || currentUser.email || 'U')[0].toUpperCase()}
               </div>
               <div className="user-info">
-                <div className="user-name">{currentUser.username || currentUser.email}</div>
+                <div className="user-name">{currentUser.full_name || currentUser.username || currentUser.email}</div>
                 <div className="user-role">Free Plan</div>
               </div>
             </div>

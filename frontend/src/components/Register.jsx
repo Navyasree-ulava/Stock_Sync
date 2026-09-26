@@ -2,6 +2,10 @@
 import { useState } from 'react'
 import axios from 'axios'
 
+const errorMessage = detail => Array.isArray(detail)
+  ? detail.map(item => item.msg || String(item)).join(' ')
+  : detail
+
 export default function Register({ onRegisterSuccess, onNavigateToLogin }) {
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
@@ -29,7 +33,7 @@ export default function Register({ onRegisterSuccess, onNavigateToLogin }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault()
-    if (!fullName.trim() || !email.trim() || !password.trim()) return
+    if (!fullName.trim() || !email.trim() || !password) return
 
     const pwError = validatePassword(password)
     if (pwError) {
@@ -41,16 +45,19 @@ export default function Register({ onRegisterSuccess, onNavigateToLogin }) {
     setError('')
 
     try {
-      await axios.post('/auth/register', {
+      const { data } = await axios.post('/auth/register', {
         full_name: fullName.trim(),
         email: email.trim(),
-        password: password,
-        business_name: businessName.trim() || null
+        password,
+        business_name: businessName.trim() || null,
       })
-      
-      onRegisterSuccess()
+
+      if (typeof data?.access_token !== 'string' || !data.access_token || !data.user) {
+        throw new Error('The API returned an invalid registration response.')
+      }
+      onRegisterSuccess(data.access_token, data.user)
     } catch (err) {
-      setError(err.response?.data?.detail || 'Registration failed. Username/Email may already exist.')
+      setError(errorMessage(err.response?.data?.detail) || err.message || 'Registration failed. Email may already exist.')
     } finally {
       setLoading(false)
     }

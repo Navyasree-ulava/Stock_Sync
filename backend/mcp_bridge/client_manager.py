@@ -6,6 +6,7 @@ The only change: module path is now backend/mcp/client_manager.py.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -50,17 +51,23 @@ class MCPManager:
         if not self.session:
             return
         result = await self.session.list_tools()
-        self._tools = [
-            {
+        self._tools = []
+        for tool in result.tools:
+            parameters = copy.deepcopy(tool.inputSchema)
+            properties = parameters.get("properties", {})
+            properties.pop("user_id", None)
+            parameters["properties"] = properties
+            parameters["required"] = [
+                field for field in parameters.get("required", []) if field != "user_id"
+            ]
+            self._tools.append({
                 "type": "function",
                 "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.inputSchema,
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": parameters,
                 },
-            }
-            for t in result.tools
-        ]
+            })
         log.info(f"[MCP-CLIENT] Loaded {len(self._tools)} tools.")
 
     def get_tools(self) -> list:
@@ -70,9 +77,28 @@ class MCPManager:
         if not self.session:
             return {"error": "MCP session not initialized"}
         try:
-            result = await self.session.call_tool(tool_name, arguments)
+            result = await asyncio.wait_for(
+                self.session.call_tool(tool_name, arguments),
+                timeout=30,
+            )
             if result.isError:
-                return {"error": str(result.content)}
+                # A raising tool returns a message that can embed the full SQL
+                # statement and bound parameters on later lines. str() of the
+                # content list is a single-line pydantic repr with escaped
+                # newlines, so read .text and keep only the first line.
+                detail = " ".join(
+                    getattr(item, "text", "") or "" for item in (result.content or [])
+                ).strip()
+                if not detail:
+                    detail = str(result.content)
+                log.error(f"[MCP-CLIENT] Tool '{tool_name}' raised: {detail}")
+                first_line = next(
+                    (line.strip() for line in detail.splitlines() if line.strip()), ""
+                )
+                prefix = f"Error executing tool {tool_name}:"
+                if first_line.startswith(prefix):
+                    first_line = first_line[len(prefix):].strip()
+                return {"error": f"Tool '{tool_name}' failed: {first_line[:300]}"}
 
             parsed = []
             for item in result.content:

@@ -5,9 +5,9 @@ export default function Settings({ currentUser, onLogout }) {
   const [activeTab, setActiveTab] = useState('profile')
   const [saved, setSaved] = useState(false)
   const [form, setForm] = useState({
-    username: currentUser?.username || '',
+    fullName: currentUser?.full_name || currentUser?.username || '',
     email: currentUser?.email || '',
-    businessName: '',
+    businessName: currentUser?.business_name || '',
     industry: 'Retail',
     currency: 'USD',
     lowStockThreshold: 10,
@@ -49,11 +49,11 @@ export default function Settings({ currentUser, onLogout }) {
           <div className="settings-section">
             <div className="settings-avatar-row">
               <div className="settings-avatar">
-                {(currentUser?.username || currentUser?.email || 'U')[0].toUpperCase()}
+                {(currentUser?.full_name || currentUser?.username || currentUser?.email || 'U')[0].toUpperCase()}
               </div>
               <div>
                 <div className="settings-avatar-name">
-                  {currentUser?.username || currentUser?.email}
+                  {currentUser?.full_name || currentUser?.username || currentUser?.email}
                 </div>
                 <div className="settings-avatar-plan">Free Plan</div>
               </div>
@@ -61,11 +61,11 @@ export default function Settings({ currentUser, onLogout }) {
 
             <div className="settings-form">
               <div className="settings-field">
-                <label className="sf-label">Username</label>
+                <label className="sf-label">Full Name</label>
                 <input
                   className="sf-input"
-                  value={form.username}
-                  onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
+                  value={form.fullName}
+                  onChange={e => setForm(f => ({ ...f, fullName: e.target.value }))}
                   placeholder="Your name"
                 />
               </div>

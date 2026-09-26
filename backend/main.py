@@ -22,8 +22,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
         run_migrations(engine)
     except Exception as e:
         log.error(f"DB migration failed: {e}", exc_info=True)
+        raise
 
     # 2. Initialize MCP server subprocess
     try:
@@ -75,6 +78,7 @@ async def lifespan(app: FastAPI):
         log.info(f"MCP ready: {tool_count} tools loaded.")
     except Exception as e:
         log.error(f"MCP startup failed: {e}", exc_info=True)
+        raise
 
     yield
 
@@ -127,12 +131,34 @@ app.include_router(users_router)
 # ─── Health ──────────────────────────────────────────────────
 @app.get("/health", tags=["health"])
 async def health_check():
-    from ai.agent import PROVIDER, MODEL
-    return {
-        "status": "ok",
+    from ai.agent import API_KEY, MODEL, PROVIDER
+
+    database_status = "ok"
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            connection.execute(text(
+                "SELECT id, full_name, email, business_name, hashed_password, is_active FROM users LIMIT 0"
+            ))
+            connection.execute(text(
+                "SELECT id, user_id, name, category, stock, price, supplier FROM products LIMIT 0"
+            ))
+    except Exception as exc:
+        database_status = "unavailable"
+        log.error("Database health check failed: %s", exc)
+
+    mcp_status = "ok" if mcp_manager.get_tools() else "unavailable"
+    overall_status = "ok" if database_status == mcp_status == "ok" else "degraded"
+    payload = {
+        "status": overall_status,
         "service": "StockSync",
         "version": "3.0.0",
-        "database": "postgresql",
+        "database": database_status,
+        "mcp": mcp_status,
+        "ai_configured": bool(API_KEY),
         "provider": PROVIDER,
-        "model": MODEL
+        "model": MODEL,
     }
+    if overall_status != "ok":
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
+    return payload

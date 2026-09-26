@@ -38,36 +38,54 @@ export default function Dashboard({ onNavigate, onQuery }) {
   const [lowStock, setLowStock] = useState([])
   const [loadingStats, setLoadingStats] = useState(true)
   const [loadingCats, setLoadingCats] = useState(true)
+  const [loadError, setLoadError] = useState('')
 
   useEffect(() => {
+    let active = true
     setLoadingStats(true)
-    axios.get('/inventory/stats')
-      .then(r => setStats(r.data))
-      .catch(() => setStats(null))
-      .finally(() => setLoadingStats(false))
-
     setLoadingCats(true)
-    axios.get('/inventory/products?per_page=200')
-      .then(r => {
-        const prods = r.data?.products || []
-        // Build category summary
-        const catMap = {}
-        prods.forEach(p => {
-          const c = p.category || 'Uncategorized'
-          if (!catMap[c]) catMap[c] = { count: 0, stock: 0, value: 0 }
-          catMap[c].count++
-          catMap[c].stock += p.stock || 0
-          catMap[c].value += (p.stock || 0) * (p.price || 0)
+    setLoadError('')
+
+    Promise.all([
+      axios.get('/inventory/stats'),
+      axios.get('/inventory/products?per_page=200'),
+    ])
+      .then(([statsResponse, productsResponse]) => {
+        if (!active) return
+        setStats(statsResponse.data)
+        const products = productsResponse.data?.products || []
+        const categoryMap = {}
+        products.forEach(product => {
+          const category = product.category || 'Uncategorized'
+          if (!categoryMap[category]) categoryMap[category] = { count: 0, stock: 0, value: 0 }
+          categoryMap[category].count++
+          categoryMap[category].stock += product.stock || 0
+          categoryMap[category].value += (product.stock || 0) * (product.price || 0)
         })
         setCategories(
-          Object.entries(catMap)
-            .map(([name, d]) => ({ name, ...d }))
+          Object.entries(categoryMap)
+            .map(([name, data]) => ({ name, ...data }))
             .sort((a, b) => b.stock - a.stock)
         )
-        setLowStock(prods.filter(p => (p.stock || 0) < 10).sort((a, b) => a.stock - b.stock).slice(0, 5))
+        setLowStock(
+          products
+            .filter(product => (product.stock || 0) < 10)
+            .sort((a, b) => a.stock - b.stock)
+            .slice(0, 5)
+        )
       })
-      .catch(() => {})
-      .finally(() => setLoadingCats(false))
+      .catch(error => {
+        if (!active) return
+        const detail = error.response?.data?.detail
+        setLoadError(Array.isArray(detail) ? detail.map(item => item.msg).join(' ') : (detail || 'Unable to load inventory. Check the API and try again.'))
+      })
+      .finally(() => {
+        if (!active) return
+        setLoadingStats(false)
+        setLoadingCats(false)
+      })
+
+    return () => { active = false }
   }, [])
 
   const isEmpty = !loadingStats && stats && stats.total_products === 0
@@ -99,7 +117,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
         <KpiCard
           icon="📦"
           label="Total Products"
-          value={stats?.total_products ?? 0}
+          value={loadError ? '—' : (stats?.total_products ?? 0)}
           sub="Unique SKUs"
           accent="#00ff88"
           loading={loadingStats}
@@ -107,7 +125,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
         <KpiCard
           icon="🏷"
           label="Categories"
-          value={stats?.total_categories ?? 0}
+          value={loadError ? '—' : (stats?.total_categories ?? 0)}
           sub="Product groups"
           accent="#00d4ff"
           loading={loadingStats}
@@ -115,7 +133,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
         <KpiCard
           icon="📊"
           label="Total Units"
-          value={stats?.total_units ?? 0}
+          value={loadError ? '—' : (stats?.total_units ?? 0)}
           sub="Items in stock"
           accent="#ffd700"
           loading={loadingStats}
@@ -123,7 +141,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
         <KpiCard
           icon="⚠"
           label="Low Stock"
-          value={isEmpty ? 0 : lowStock.length}
+          value={loadError ? '—' : (isEmpty ? 0 : lowStock.length)}
           sub="Below 10 units"
           accent="#ff6b2b"
           loading={loadingCats}
@@ -131,7 +149,7 @@ export default function Dashboard({ onNavigate, onQuery }) {
         <KpiCard
           icon="💰"
           label="Inventory Value"
-          value={isEmpty ? '₹0' : `$${inventoryValue.toLocaleString('en', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`}
+          value={loadError ? '—' : (isEmpty ? '$0' : `$${inventoryValue.toLocaleString('en', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`)}
           sub="Estimated total"
           accent="#9b5de5"
           loading={loadingCats}
@@ -139,7 +157,15 @@ export default function Dashboard({ onNavigate, onQuery }) {
       </div>
 
       {/* ── Main Content Grid ───────────────────────────────────── */}
-      {isEmpty ? (
+      {loadError ? (
+        <div className="dash-panel" style={{ marginTop: '1.5rem', textAlign: 'center', padding: '3rem' }}>
+          <h2 className="dash-title" style={{ color: 'var(--orange)' }}>Inventory unavailable</h2>
+          <p className="dash-sub" style={{ margin: '0.75rem 0 1.5rem' }}>{loadError}</p>
+          <button className="dash-action-btn primary" onClick={() => window.location.reload()}>
+            Retry
+          </button>
+        </div>
+      ) : isEmpty ? (
         <div className="dash-onboarding-wrapper">
           <div className="dash-onboarding-card">
             <h2 className="dash-onboarding-title">👋 Welcome to StockSync</h2>

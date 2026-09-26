@@ -11,7 +11,7 @@ StockSync is a multi-tenant retail inventory application with a React dashboard,
 - Product create, read, update, delete, search, category filtering, and pagination
 - CSV and XLSX import with column auto-detection, preview, and duplicate strategies
 - Dashboard and client-side analytics based on the current user's products
-- Natural-language inventory queries through ten MCP tools
+- Natural-language inventory CRUD through thirteen MCP tools with deterministic routing
 - AI-assisted stock quantity updates, scoped to the authenticated user
 - Persistent chat history for the most recent 100 messages
 - Browser speech recognition and optional ElevenLabs text-to-speech
@@ -211,7 +211,7 @@ npm ci
 npm run dev
 ```
 
-Open http://localhost:5173. The template sets the browser API base URL to http://localhost:8000.
+Open http://localhost:5173. The template targets the Docker backend at http://localhost:8080. If you run Uvicorn directly on the host instead, change `VITE_API_URL` to `http://localhost:8000`.
 
 ## Environment variables
 
@@ -229,15 +229,16 @@ The backend loads the repository-root `.env` file.
 | `ALLOWED_ORIGINS` | No | localhost origins | Comma-separated CORS allowlist |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `60` | Access-token lifetime |
 | `GROQ_API_KEY` | Required for `/query` | none | Groq API credential |
-| `LLM_MODEL` | No | `llama-3.3-70b-versatile` | Overrides the Groq model |
+| `LLM_MODEL` | No | `openai/gpt-oss-20b` | Overrides the Groq tool-calling model |
 | `LLM_MAX_TURNS` | No | `10` | Maximum model/tool loop iterations |
 | `ELEVENLABS_API_KEY` | For TTS | none | ElevenLabs credential |
 | `ELEVENLABS_VOICE_ID` | For TTS | none | ElevenLabs voice ID |
+| `ELEVENLABS_MODEL` | No | `eleven_flash_v2_5` | ElevenLabs speech model |
 | `MCP_HOST` | Standalone MCP only | `0.0.0.0` | Standalone MCP HTTP bind address |
 | `MCP_PORT` | Standalone MCP only | `8001` | Standalone MCP HTTP port |
 | `MCP_TRANSPORT` | Standalone MCP only | `http` | `http` or `stdio`; FastAPI forces `stdio` for its child process |
 
-The default Groq model is `llama-3.3-70b-versatile`.
+The default Groq model is `openai/gpt-oss-20b`, which is configured for tool calling.
 
 ### Frontend
 
@@ -245,7 +246,7 @@ Vite reads variables from `frontend/.env.local` during local development.
 
 | Variable | Purpose |
 | --- | --- |
-| `VITE_API_URL` | Browser-reachable API base URL; use `http://localhost:8000` for host development |
+| `VITE_API_URL` | Browser-reachable API base URL; use port `8080` for the Docker backend or `8000` for a host Uvicorn process |
 
 For the Docker stack, the frontend is compiled with an empty `VITE_API_URL`, so requests use relative URLs and Nginx proxies them to FastAPI. Vite variables are embedded into the browser bundle at build time—never put secrets in `VITE_*` variables.
 
@@ -279,8 +280,8 @@ Authorization: Bearer <access_token>
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
-| `GET` | `/health` | Public | Static liveness and provider/model metadata |
-| `POST` | `/auth/register` | Public | Create an account with an empty inventory |
+| `GET` | `/health` | Public | PostgreSQL/MCP readiness plus provider/model metadata |
+| `POST` | `/auth/register` | Public | Create an account and return a JWT/user profile |
 | `POST` | `/auth/login` | Public | Return a JWT and user profile |
 | `POST` | `/auth/logout` | Bearer | Log the logout event; the token is not revoked |
 | `POST` | `/inventory/ingest` | Bearer | Legacy JSON append/replace ingestion |
@@ -309,16 +310,19 @@ The assistant receives these tool schemas from `mcp_server/server.py`:
 
 1. `query_inventory_db` — partial or fuzzy product-name search
 2. `get_product_details` — fetch one product by ID
-3. `search_inventory` — filter, sort, and paginate products
-4. `get_low_stock_items` — return products below a threshold
-5. `get_all_categories` — list distinct categories
-6. `get_products_by_category` — list products in a category
-7. `get_products_by_names` — match a list of names
-8. `get_inventory_analytics` — totals, value, average price, and extremes
-9. `get_category_analytics` — per-category counts, stock, and average price
-10. `update_stock` — update one product's stock quantity
+3. `create_product` — insert and return one verified database row
+4. `search_inventory` — filter, sort, and paginate products
+5. `get_low_stock_items` — return products below a threshold
+6. `get_all_categories` — list distinct categories
+7. `get_products_by_category` — list products in one category
+8. `get_products_by_names` — match a list of names
+9. `get_inventory_analytics` — totals, value, average price, and extremes
+10. `get_category_analytics` — per-category counts, stock, and average price
+11. `update_stock` — update one product's stock quantity
+12. `update_product` — update one product's stock, price, and/or category together
+13. `delete_product` — delete one verified database row
 
-The backend injects the authenticated user's ID into every tool call. The model cannot create or delete products, but it can change stock through `update_stock`.
+The backend injects the authenticated user's ID into every tool call. High-confidence create, update, delete, category-list, and search requests are routed to exactly one canonical MCP tool. Their response text and tables are generated from the committed tool result, so IDs, counts, prices, and stock values are not recalculated by the LLM.
 
 ## Data model
 
@@ -340,7 +344,7 @@ python -m pip install pytest pytest-asyncio
 python -m pytest -v
 ```
 
-The repository currently defines 53 tests across authentication/security, integration, and migration coverage. The suite does not perform real LLM or TTS calls, and there is currently no frontend test or lint command.
+The repository currently defines 95 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, deterministic routing, fuzzy product-name resolution, intent-boundary rejection, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The automated suite does not perform real LLM or TTS calls; the live Docker workflow verifies those integrations separately. There is currently no frontend test or lint command.
 
 Build the frontend with:
 
@@ -388,7 +392,7 @@ StockSync/
 │   ├── src/index.css               # Application design system
 │   ├── package.json
 │   └── vite.config.js
-├── mcp_server/server.py            # Ten inventory MCP tools
+├── mcp_server/server.py            # Thirteen inventory MCP tools
 ├── tests/                          # pytest suite
 ├── .env.example                    # Backend environment template
 ├── .dockerignore
@@ -407,8 +411,12 @@ StockSync/
 - TTS is requested automatically only after a voice-originated question; there is no general replay button.
 - “Clear Session” hides current UI messages but does not delete persisted server history.
 - Audit history covers manual stock edits and AI stock updates, not every create/import/delete operation, and its UI component is not mounted.
-- The AI stock-update tool does not currently reject negative quantities like the REST product schema does.
-- `GET /health` is a static liveness response and does not verify PostgreSQL, MCP, or the LLM provider.
+- The deterministic MCP update routes support stock, price, and category changes; supplier and product-name changes are not exposed as natural-language tools.
+- One product per request. A request naming two products, or mixing two different mutation intents (for example "update X and delete X"), is rejected rather than partially applied.
+- Bulk deletion (`delete all products`) and category deletion are not supported; delete a single product by exact name or product ID.
+- Relative stock changes ("increase by 5") are rejected as ambiguous; supply an absolute target quantity.
+- Stock values must be whole numbers within the database integer range, and prices are stored rounded to two decimals, matching the REST ingest layer.
+- `GET /health` verifies PostgreSQL and MCP readiness, but does not make a paid LLM request on every check.
 - The standalone MCP HTTP server has no authentication. Do not expose it publicly; the normal application uses a private stdio subprocess.
 - `render.yaml`, `frontend/vercel.json`, and the split-deployment workflow are deployment scaffolds and need verification before production use.
 - No first-party `LICENSE` file is present in this checkout. Confirm the intended license with the upstream project before redistributing it.

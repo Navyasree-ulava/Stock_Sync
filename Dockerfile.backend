@@ -22,9 +22,9 @@ WORKDIR /app/backend
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
+  CMD python -c "import os, httpx; httpx.get('http://127.0.0.1:' + os.getenv('PORT', '8000') + '/health', timeout=5).raise_for_status()"
 
 # Run migrations then start the server.
 # Seeding is intentionally removed — new users start with empty inventory.
 # To seed a demo account manually: docker exec -it stocksync-backend python seed_db.py
-CMD ["sh", "-c", "python -c \"from db.connection import engine; from db.migrations import run_migrations; run_migrations(engine)\" && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"]
+CMD ["sh", "-c", "python -c \"from db.connection import engine; from db.migrations import run_migrations; run_migrations(engine)\" && exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips=${FORWARDED_ALLOW_IPS:-127.0.0.1}"]

@@ -9,6 +9,7 @@ Supports dataset classification (inventory, catalog, transaction, unknown).
 import io
 import csv
 import logging
+import math
 from typing import Optional, Tuple, List, Dict
 import openpyxl
 
@@ -93,7 +94,8 @@ def parse_file_rows(file_bytes: bytes, filename: str) -> Tuple[List[str], List[D
 
 
 def _parse_csv(file_bytes: bytes) -> Tuple[List[str], List[Dict[str, str]]]:
-    content = file_bytes.decode("utf-8", errors="ignore")
+    # utf-8-sig removes a BOM from the first header when present.
+    content = file_bytes.decode("utf-8-sig", errors="ignore")
     f = io.StringIO(content)
     reader = csv.DictReader(f)
     headers = [h.strip() for h in (reader.fieldnames or []) if h.strip()]
@@ -108,22 +110,39 @@ def _parse_csv(file_bytes: bytes) -> Tuple[List[str], List[Dict[str, str]]]:
 
 def _parse_xlsx(file_bytes: bytes) -> Tuple[List[str], List[Dict[str, str]]]:
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    sheet = wb.active
-    headers = []
-    rows = []
-    for i, row_vals in enumerate(sheet.iter_rows(values_only=True)):
-        if i == 0:
-            headers = [str(cell).strip() for cell in row_vals if cell is not None and str(cell).strip()]
-            continue
-        if not any(cell is not None for cell in row_vals):
-            continue
-        row_dict = {}
-        for j, val in enumerate(row_vals):
-            if j < len(headers):
-                header = headers[j]
-                row_dict[header] = str(val).strip() if val is not None else ""
-        rows.append(row_dict)
-    return headers, rows
+    try:
+        sheet = wb.active
+        headers = []
+        header_positions = []
+        rows = []
+        seen_headers = set()
+
+        for row_index, row_values in enumerate(sheet.iter_rows(values_only=True)):
+            if row_index == 0:
+                for column_index, cell in enumerate(row_values):
+                    if cell is None or not str(cell).strip():
+                        continue
+                    header = str(cell).strip()
+                    normalized = header.casefold()
+                    if normalized in seen_headers:
+                        raise ValueError(f"Duplicate XLSX header: {header}")
+                    seen_headers.add(normalized)
+                    headers.append(header)
+                    header_positions.append(column_index)
+                continue
+
+            if not any(cell is not None for cell in row_values):
+                continue
+
+            row_dict = {}
+            for column_index, header in zip(header_positions, headers):
+                value = row_values[column_index] if column_index < len(row_values) else None
+                row_dict[header] = str(value).strip() if value is not None else ""
+            rows.append(row_dict)
+
+        return headers, rows
+    finally:
+        wb.close()
 
 
 def validate_row(row: Dict[str, str], mappings: Dict[str, str], row_index: int) -> Tuple[Optional[Dict], Optional[Dict]]:
@@ -159,10 +178,13 @@ def validate_row(row: Dict[str, str], mappings: Dict[str, str], row_index: int) 
         if stock_raw:
             try:
                 # Handle potential float strings (e.g., '10.0')
-                stock = int(float(stock_raw))
+                parsed_stock = float(stock_raw)
+                if not math.isfinite(parsed_stock):
+                    raise ValueError
+                stock = int(parsed_stock)
                 if stock < 0:
                     errors.append({"field": "stock", "error": "Stock cannot be negative."})
-            except ValueError:
+            except (ValueError, OverflowError):
                 errors.append({"field": "stock", "error": f"Invalid stock number format: '{stock_raw}'"})
 
     # ── 3. Price Validation (Optional: Defaults to 0.0) ──
@@ -171,10 +193,13 @@ def validate_row(row: Dict[str, str], mappings: Dict[str, str], row_index: int) 
         price_raw = row[mapped_price].strip().replace("$", "").replace("₹", "").replace(",", "")
         if price_raw:
             try:
-                price = round(float(price_raw), 2)
+                parsed_price = float(price_raw)
+                if not math.isfinite(parsed_price):
+                    raise ValueError
+                price = round(parsed_price, 2)
                 if price < 0:
                     errors.append({"field": "price", "error": "Price cannot be negative."})
-            except ValueError:
+            except (ValueError, OverflowError):
                 errors.append({"field": "price", "error": f"Invalid price format: '{price_raw}'"})
 
     # ── 4. Category Validation (Optional: Defaults to "Uncategorized") ──
@@ -184,12 +209,11 @@ def validate_row(row: Dict[str, str], mappings: Dict[str, str], row_index: int) 
         if val:
             category = val[:100]
 
-    # ── 5. Supplier Validation (Optional: Defaults to None) ──
-    supplier = None
+    # ── 5. Supplier Validation (Optional: Defaults to "Unknown") ──
+    supplier = "Unknown"
     if mapped_supplier and mapped_supplier in row:
         val = row[mapped_supplier].strip()
-        if val:
-            supplier = val[:255]
+        supplier = (val or "Unknown")[:255]
 
     if errors:
         return None, {

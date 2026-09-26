@@ -2,6 +2,10 @@
 import { useState } from 'react'
 import axios from 'axios'
 
+const errorMessage = detail => Array.isArray(detail)
+  ? detail.map(item => item.msg || String(item)).join(' ')
+  : detail
+
 export default function Login({ onAuthSuccess, onNavigateToRegister }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -12,7 +16,7 @@ export default function Login({ onAuthSuccess, onNavigateToRegister }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault()
-    if (!email.trim() || !password.trim()) return
+    if (!email.trim() || !password) return
 
     setLoading(true)
     setError('')
@@ -20,12 +24,15 @@ export default function Login({ onAuthSuccess, onNavigateToRegister }) {
     try {
       const { data } = await axios.post('/auth/login', {
         email: email.trim(),
-        password: password.trim()
+        password,
       })
-      
+
+      if (typeof data?.access_token !== 'string' || !data.access_token || !data.user) {
+        throw new Error('The API returned an invalid authentication response.')
+      }
       onAuthSuccess(data.access_token, data.user, rememberMe)
     } catch (err) {
-      setError(err.response?.data?.detail || 'Authentication failed. Please check your credentials.')
+      setError(errorMessage(err.response?.data?.detail) || err.message || 'Authentication failed. Please check your credentials.')
     } finally {
       setLoading(false)
     }

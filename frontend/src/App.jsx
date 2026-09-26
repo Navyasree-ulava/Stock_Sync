@@ -24,9 +24,10 @@ const STORAGE_USER_KEY = 'stocksync_user'
 const LEGACY_TOKEN_KEY = 'sq_token'
 const LEGACY_USER_KEY = 'sq_user'
 
-// Move existing legacy sessions to the StockSync keys on first load.
+// Migrate legacy sessions once, then prefer session storage for non-persistent
+// logins and local storage when "Remember me" is selected.
 const getMigratedStorageValue = (key, legacyKey) => {
-  const currentValue = localStorage.getItem(key)
+  const currentValue = sessionStorage.getItem(key) ?? localStorage.getItem(key)
   const legacyValue = localStorage.getItem(legacyKey)
 
   if (currentValue === null && legacyValue !== null) {
@@ -34,6 +35,7 @@ const getMigratedStorageValue = (key, legacyKey) => {
   }
   if (legacyValue !== null) {
     localStorage.removeItem(legacyKey)
+    sessionStorage.removeItem(legacyKey)
   }
 
   return currentValue ?? legacyValue
@@ -46,6 +48,7 @@ try {
   savedUser = savedUserValue ? JSON.parse(savedUserValue) : null
 } catch {
   localStorage.removeItem(STORAGE_USER_KEY)
+  sessionStorage.removeItem(STORAGE_USER_KEY)
 }
 
 if (savedToken) {
@@ -101,23 +104,25 @@ export default function App() {
   const [activeNav, setActiveNav] = useState('dashboard')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [isListening, setIsListening] = useState(false)
-  const [modelInfo, setModelInfo] = useState('Llama-3.3-70B · Groq')
+  const [modelInfo, setModelInfo] = useState('Inventory AI · Groq')
   const [categoryRefreshKey, setCategoryRefreshKey] = useState(0)
   const triggerCategoryRefresh = () => setCategoryRefreshKey(prev => prev + 1)
   const chatRef  = useRef(null)
   const inputRef = useRef(null)
+  const logoutInProgressRef = useRef(false)
+  const authGenerationRef = useRef(0)
 
   // Axios response interceptor to handle 401 token expiration
   // IMPORTANT: skip auth endpoints — a wrong password returns 401 and should
   // NOT trigger a logout loop. Only force-logout on protected endpoint 401s.
   useEffect(() => {
-    const AUTH_PATHS = ['/auth/login', '/auth/register']
+    const AUTH_PATHS = ['/auth/login', '/auth/register', '/auth/logout']
     const interceptor = axios.interceptors.response.use(
       (response) => response,
       (error) => {
         const url = error.config?.url || ''
-        const isAuthRequest = AUTH_PATHS.some(p => url.includes(p))
-        if (error.response?.status === 401 && !isAuthRequest) {
+        const isAuthRequest = AUTH_PATHS.some(path => url.includes(path))
+        if ([401, 403].includes(error.response?.status) && !isAuthRequest) {
           handleLogout()
         }
         return Promise.reject(error)
@@ -133,70 +138,126 @@ export default function App() {
     axios.get('/health')
       .then(res => {
         if (res.data && res.data.provider) {
-          const providerName = res.data.provider.charAt(0).toUpperCase() + res.data.provider.slice(1);
-          let modelName = 'Llama-3.3-70B';
-          if (res.data.model && res.data.model.toLowerCase().includes('versatile')) {
-            modelName = 'Llama-3.3-70B';
+          const providerName = res.data.provider.charAt(0).toUpperCase() + res.data.provider.slice(1)
+          const modelId = res.data.model || ''
+          const modelNames = {
+            'openai/gpt-oss-20b': 'GPT-OSS 20B',
+            'openai/gpt-oss-120b': 'GPT-OSS 120B',
+            'qwen/qwen3.8-27b': 'Qwen 3.8 27B',
           }
-          setModelInfo(`${modelName} · ${providerName}`);
+          const modelName = modelNames[modelId] || modelId || 'Inventory AI'
+          setModelInfo(`${modelName} · ${providerName}`)
         }
       })
       .catch(() => {});
   }, [authState])
 
-  // Automatically fetch chat history on authenticated mount/login
+  // Reconcile cached identity with the server before rendering tenant data.
   useEffect(() => {
-    if (authState === 'authenticated') {
-      axios.get('/history')
-        .then(res => {
-          if (res.data && res.data.messages) {
-            // Map saved message list to UI messages state
-            const mapped = res.data.messages.map(m => ({
-              id: m.id,
-              role: m.role,
-              content: m.content,
-              toolUsed: m.tool_used,
-              timestamp: new Date(m.created_at || Date.now())
-            }))
-            setMessages(mapped)
-          }
-        })
-        .catch(err => console.error("Failed to retrieve chat history:", err))
-    } else {
-      setMessages([])
-    }
+    if (authState !== 'authenticated') return undefined
+
+    let active = true
+    const generation = authGenerationRef.current
+    axios.get('/users/me')
+      .then(({ data: user }) => {
+        if (!active || generation !== authGenerationRef.current) return
+        setCurrentUser(user)
+        const storage = sessionStorage.getItem(STORAGE_TOKEN_KEY) ? sessionStorage : localStorage
+        storage.setItem(STORAGE_USER_KEY, JSON.stringify(user))
+      })
+      .catch(() => {
+        // The response interceptor performs one guarded logout.
+      })
+
+    return () => { active = false }
   }, [authState])
 
-  const handleAuthSuccess = (newToken, user, rememberMe) => {
-    localStorage.setItem(STORAGE_TOKEN_KEY, newToken)
-    localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(user))
+  // Automatically fetch chat history on authenticated mount/login
+  useEffect(() => {
+    if (authState !== 'authenticated') {
+      setMessages([])
+      return undefined
+    }
+
+    let active = true
+    const generation = authGenerationRef.current
+    axios.get('/history')
+      .then(res => {
+        if (!active || generation !== authGenerationRef.current || !res.data?.messages) return
+        const mapped = res.data.messages.map(message => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          toolUsed: message.tool_used,
+          timestamp: new Date(message.created_at || Date.now()),
+        }))
+        setMessages(mapped)
+      })
+      .catch(error => {
+        if (active && generation === authGenerationRef.current) {
+          console.error('Failed to retrieve chat history:', error)
+        }
+      })
+
+    return () => { active = false }
+  }, [authState])
+
+  const handleAuthSuccess = (newToken, user, rememberMe = false) => {
+    authGenerationRef.current += 1
+    localStorage.removeItem(STORAGE_TOKEN_KEY)
+    localStorage.removeItem(STORAGE_USER_KEY)
+    sessionStorage.removeItem(STORAGE_TOKEN_KEY)
+    sessionStorage.removeItem(STORAGE_USER_KEY)
+
+    const storage = rememberMe ? localStorage : sessionStorage
+    storage.setItem(STORAGE_TOKEN_KEY, newToken)
+    storage.setItem(STORAGE_USER_KEY, JSON.stringify(user))
     axios.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
     setToken(newToken)
     setCurrentUser(user)
+    setMessages([])
+    setLoading(false)
     setAuthState('authenticated')
     setActiveNav('dashboard')
   }
 
-  const handleLogout = async () => {
-    try {
-      // Best effort API logout call
-      await axios.post('/auth/logout')
-    } catch (e) {
-      // Ignore network errors on logout
+  const handleLogout = () => {
+    if (logoutInProgressRef.current) return
+    logoutInProgressRef.current = true
+    authGenerationRef.current += 1
+
+    const authorization = axios.defaults.headers.common?.Authorization
+    for (const storage of [localStorage, sessionStorage]) {
+      storage.removeItem(STORAGE_TOKEN_KEY)
+      storage.removeItem(STORAGE_USER_KEY)
+      storage.removeItem(LEGACY_TOKEN_KEY)
+      storage.removeItem(LEGACY_USER_KEY)
     }
-    localStorage.removeItem(STORAGE_TOKEN_KEY)
-    localStorage.removeItem(STORAGE_USER_KEY)
-    localStorage.removeItem(LEGACY_TOKEN_KEY)
-    localStorage.removeItem(LEGACY_USER_KEY)
     delete axios.defaults.headers.common['Authorization']
     setToken(null)
     setCurrentUser(null)
+    setMessages([])
+    setLoading(false)
     setAuthState('landing')
+
+    if (authorization) {
+      axios.post('/auth/logout', null, {
+        headers: { Authorization: authorization },
+        timeout: 3000,
+      }).catch(() => {
+        // Logout is best effort; local state is already cleared.
+      }).finally(() => {
+        logoutInProgressRef.current = false
+      })
+    } else {
+      logoutInProgressRef.current = false
+    }
   }
 
-  const playTTS = async (text) => {
+  const playTTS = async (text, generation) => {
     try {
       const response = await axios.post('/tts', { text }, { responseType: 'blob' })
+      if (generation !== authGenerationRef.current) return
       const audioUrl = URL.createObjectURL(response.data)
       const audio = new Audio(audioUrl)
       audio.play()
@@ -239,6 +300,7 @@ export default function App() {
   const sendMessage = useCallback(async (questionText, wasVoice = false) => {
     const question = (typeof questionText === 'string' ? questionText : input).trim()
     if (!question || loading) return
+    const generation = authGenerationRef.current
 
     setInput('')
     setLoading(true)
@@ -253,20 +315,37 @@ export default function App() {
 
     try {
       const { data } = await axios.post('/query', { question })
+      if (generation !== authGenerationRef.current) return
+      // A routed failure returns HTTP 200 with the error inside data[0].
+      // Surface it as an error bubble and only table the candidate rows,
+      // never the { error, matches } envelope itself.
+      const rows = Array.isArray(data.data) ? data.data : null
+      const envelope = rows && rows.length > 0 ? rows[0] : null
+      const routedError = envelope && typeof envelope === 'object' && envelope.error
+        ? String(envelope.error)
+        : null
+      const tableRows = routedError
+        ? (Array.isArray(envelope.matches) && envelope.matches.length > 0 ? envelope.matches : null)
+        : data.data
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         role: 'ai',
         content: data.answer,
         toolUsed: data.tool_used,
-        data: data.data,
+        data: tableRows,
         userQuery: question, // Store original question to detect intent
         timestamp: new Date(),
+        error: Boolean(routedError),
       }])
       if (wasVoice === true) {
-        playTTS(data.answer)
+        playTTS(data.answer, generation)
       }
     } catch (err) {
-      const detail = err.response?.data?.detail || 'Query failed. Check backend connection.'
+      if (generation !== authGenerationRef.current) return
+      const errorDetail = err.response?.data?.detail
+      const detail = Array.isArray(errorDetail)
+        ? errorDetail.map(item => item.msg || String(item)).join(' ')
+        : errorDetail || 'Query failed. Check backend connection.'
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         role: 'ai',
@@ -275,8 +354,10 @@ export default function App() {
         error: true,
       }])
     } finally {
-      setLoading(false)
-      setTimeout(() => inputRef.current?.focus(), 50)
+      if (generation === authGenerationRef.current) {
+        setLoading(false)
+        setTimeout(() => inputRef.current?.focus(), 50)
+      }
     }
   }, [input, loading])
 
@@ -298,7 +379,10 @@ export default function App() {
   }
 
   if (authState === 'register') {
-    return <Register onRegisterSuccess={() => setAuthState('login')} onNavigateToLogin={() => setAuthState('login')} />
+    return <Register
+      onRegisterSuccess={(newToken, user) => handleAuthSuccess(newToken, user, false)}
+      onNavigateToLogin={() => setAuthState('login')}
+    />
   }
 
   return (
