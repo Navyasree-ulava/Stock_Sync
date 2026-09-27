@@ -15,6 +15,7 @@ StockSync understands the request, converts it into a structured operation, vali
 ## ✨ What StockSync Does
 
 - 🧠 **Natural-language inventory management**
+- 🎙️ **Voice-based inventory commands**
 - 📦 Create, update, search, and delete products
 - 💬 Multi-turn conversations for incomplete requests
 - 📊 Inventory dashboard and analytics
@@ -34,22 +35,26 @@ StockSync understands the request, converts it into a structured operation, vali
 
 StockSync uses an LLM to understand natural-language requests, while keeping business logic and database operations under deterministic backend control.
 
+Input can come from either **text or voice**.
+
 ```text
                          User
                           │
+                    ┌─────┴─────┐
+                    │           │
+                 Text         Voice
+                    │           │
+                    │     ElevenLabs API
+                    │           │
+                    └─────┬─────┘
+                          │
                           ▼
-                ┌──────────────────┐
-                │  Natural Language │
-                │     Request       │
-                └────────┬─────────┘
-                         │
-                         ▼
-                ┌──────────────────┐
-                │  LLM Intent       │
-                │    Extraction     │
-                └────────┬─────────┘
-                         │
-                         ▼
+                 ┌──────────────────┐
+                 │  LLM Intent      │
+                 │    Extraction    │
+                 └────────┬─────────┘
+                          │
+                          ▼
           ┌─────────────────────────────┐
           │      Backend Application    │
           │                             │
@@ -89,13 +94,35 @@ Application validation, authorization, tool selection, and database operations r
 
 ## 💬 Natural-Language Interaction
 
-Users can interact with the system naturally.
+Users can interact with the system naturally through **text or voice**.
 
-### Create
+### Text
 
 ```text
 Add an iPhone to electronics with 60 units,
 price 100000, supplier Apple.
+```
+
+### Voice
+
+Users can speak inventory commands naturally, for example:
+
+> **"Add an iPhone to electronics. We have 60 units, the price is one lakh, and Apple is the supplier."**
+
+Voice input is processed using the **ElevenLabs API** and then passed through the same natural-language intent pipeline used for text requests.
+
+This means both text and voice ultimately use the same backend workflow:
+
+```text
+Text / Voice
+     ↓
+Intent Extraction
+     ↓
+Validation
+     ↓
+Inventory Operation
+     ↓
+Database
 ```
 
 ### Search
@@ -132,15 +159,19 @@ StockSync can continue an operation when the initial request does not contain al
 
 ```text
 User:
+
 Add iPhone to electronics.
 
 StockSync:
+
 What price, stock quantity, and supplier should I use?
 
 User:
+
 ₹100000, 60 units, Apple.
 
 StockSync:
+
 Created iPhone successfully.
 ```
 
@@ -173,6 +204,10 @@ Handles:
 
 Converts natural-language requests into structured intents that the backend can process.
 
+### Voice Layer
+
+Uses the **ElevenLabs API** to support voice-based interaction with the inventory system.
+
 ### MCP Layer
 
 Provides typed tools for inventory operations between the application and database layer.
@@ -190,6 +225,7 @@ PostgreSQL stores users, products, inventory information, and application data.
 | Frontend | React, Vite, Axios, Recharts |
 | Backend | Python, FastAPI, Uvicorn |
 | AI | LLM-based intent extraction |
+| Voice | ElevenLabs API |
 | Tooling | Model Context Protocol (MCP) |
 | Database | PostgreSQL |
 | ORM | SQLAlchemy |
@@ -203,6 +239,7 @@ PostgreSQL stores users, products, inventory information, and application data.
 
 ```text
 StockSync/
+
 │
 ├── backend/
 │   ├── ai/
@@ -235,6 +272,7 @@ StockSync/
 - Docker
 - Docker Compose
 - Groq API key
+- ElevenLabs API key *(required for voice features)*
 
 ### Clone the repository
 
@@ -252,9 +290,9 @@ cp .env.example .env
 Configure the required variables:
 
 ```env
-SECRET_KEY=<your-secret-key>
 GROQ_API_KEY=<your-groq-api-key>
 DATABASE_URL=<your-database-url>
+ELEVENLABS_API_KEY=<your-elevenlabs-api-key>
 ```
 
 Refer to `.env.example` for the complete configuration.
@@ -280,127 +318,3 @@ The application will be available at:
 docker exec -it stocksync-backend python seed_db.py
 ```
 
----
-
-## 🧪 Testing
-
-Run the automated test suite with:
-
-```bash
-cd backend
-python -m pytest ../tests -q
-```
-
-The test suite covers:
-
-- Authentication and authorization
-- Tenant isolation
-- Inventory operations
-- Database behavior
-- MCP tools
-- Intent processing
-- Conversational clarification
-- Input validation
-- Integration flows
-
----
-
-## 🔐 Security
-
-StockSync keeps application control separate from LLM interpretation.
-
-Key security measures include:
-
-- JWT-based authentication
-- Password hashing
-- Tenant-scoped database access
-- Backend-controlled user identity
-- Input validation
-- Controlled MCP tool execution
-- Confirmation for destructive operations
-- Sanitized responses
-
-The LLM does not directly execute SQL or access another user's inventory.
-
----
-
-## 🎯 Why StockSync?
-
-Traditional inventory systems require users to interact with structured forms and predefined workflows.
-
-StockSync explores a different interaction model:
-
-```text
-Traditional Application
-
-User → Form → API → Database
-```
-
-versus:
-
-```text
-StockSync
-
-User → Natural Language → Intent → Backend → MCP → Database
-```
-
-The goal is to make inventory operations feel more conversational while retaining the reliability and control expected from a traditional backend application.
-
----
-
-## 📌 Example Workflow
-
-```text
-User
-│
-│  "Add 50 Logitech mice to accessories at ₹2500 each."
-│
-▼
-LLM
-│
-│  Structured intent
-│
-▼
-Backend
-│
-│  Validate + authorize + resolve operation
-│
-▼
-MCP
-│
-│  Execute typed inventory operation
-│
-▼
-PostgreSQL
-│
-│  Persist inventory
-│
-▼
-StockSync
-│
-│  Return result
-│
-▼
-User
-```
-
----
-
-## 📈 Project Highlights
-
-- Full-stack inventory management application
-- Natural-language interface
-- LLM-based structured intent extraction
-- Deterministic backend business logic
-- MCP tool integration
-- PostgreSQL persistence
-- JWT authentication and tenant isolation
-- Conversational multi-turn workflows
-- Automated test coverage
-- Docker-based deployment
-
----
-
-## License
-
-No license has currently been specified for this repository.
