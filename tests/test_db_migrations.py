@@ -8,7 +8,7 @@ and constraints using an in-memory SQLite engine (no PostgreSQL needed).
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from db.models import User, Product, StockAuditLog, ChatHistory
+from db.models import User, Product, StockAuditLog
 
 
 def test_schema_creates_all_tables(db_engine):

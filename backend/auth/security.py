@@ -7,7 +7,6 @@ All auth primitives live here. Routes and dependencies import from this module.
 import os
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import bcrypt
 import jwt

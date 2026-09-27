@@ -6,14 +6,15 @@ httpx>=0.24.0
 mcp>=1.0.0
 
 # Database
-sqlalchemy>=2.0.0
+# Held below 2.1: SQLAlchemy 2.1 changed the default driver for a bare
+# postgresql:// URL from psycopg2 to psycopg3, which would silently switch
+# the driver away from the psycopg2-binary pinned below.
+sqlalchemy>=2.0.0,<2.1
 psycopg2-binary>=2.9.9
 
 # Auth
 bcrypt>=4.0.0
 pyjwt>=2.8.0
-passlib[bcrypt]>=1.7.4
-python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.9
 
 # Rate limiting & validation

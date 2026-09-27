@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from db.connection import SessionLocal, engine
-from db.models import Base, User, Product, StockAuditLog, ChatHistory
+from db.models import User, Product
 
 logging.basicConfig(
     level=logging.INFO,

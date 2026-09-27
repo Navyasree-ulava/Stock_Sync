@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from openai import (
-    APIConnectionError,
     AuthenticationError,
     BadRequestError,
     NotFoundError,
@@ -25,15 +24,13 @@ from openai import (
 from pydantic import BaseModel
 
 from mcp_bridge.client_manager import mcp_manager
-from db.models import display_category, normalize_category
+from db.models import normalize_category
 
 from .clarification import clarification_store
 from .intent_schema import (
-    CANONICAL_TOOL,
     INTENT_TOOL,
     MUTATING_INTENTS,
     SYSTEM_PROMPT_INTENT,
-    KNOWN_INTENTS,
     Clarification,
     IntentPlan,
     Rejection,

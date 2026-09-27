@@ -5,7 +5,7 @@ db/models.py — SQLAlchemy declarative models for PostgreSQL
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 

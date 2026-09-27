@@ -24,7 +24,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from db.models import display_category, normalize_category
+from db.models import normalize_category
 
 log = logging.getLogger(__name__)
 

@@ -1,117 +1,71 @@
-# Environment files (keep templates, ignore real/local values)
+# ── Secrets and local environment ────────────────────────────────────────────
+# Templates stay tracked; real values never do.
 .env
 .env.*
 !.env.example
 !**/.env.example
 
-# Python
-# Byte-compiled / optimized / DLL files
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
-.Python
+*.egg-info/
+.eggs/
 build/
-develop-eggs/
 dist/
 downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
 .venv/
 venv/
 ENV/
 env/
 
-# Pytest cache
+# ── Tests and coverage ───────────────────────────────────────────────────────
 .pytest_cache/
-
-# Coverage
-htmlcov/
 .coverage
 .coverage.*
 coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Node / frontend
+# ── Node / frontend ──────────────────────────────────────────────────────────
 node_modules/
-dist/
+/frontend/dist/
 /.vite/
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
 
-# Vite / build output
-/frontend/dist/
+# ── Local databases and logs ─────────────────────────────────────────────────
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sql
 
-# Docker
-# Ignore Docker build artifacts and local compose overrides
+# ── Large or sensitive datasets (keep out of Git; supply your own) ──────────
+backend/dataset.csv
+backend/Grocery_Inventory_and_Sales_Dataset.csv
+backend/inventory_1000.csv
+
+# ── Docker ───────────────────────────────────────────────────────────────────
 **/docker-compose.override.yml
 **/docker-compose.*.yml
 docker-compose.override.yml
 docker-compose.*.yml
 Dockerfile.*.local
 
-# IDEs and editors
-.vscode/
-.idea/
-/.history/
-
-# macOS
-.DS_Store
-
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# Certificate / SSH keys
-*.pem
-*.key
-*.crt
-
-# Logs and databases
-*.log
-*.sql
-*.sqlite
-*.sqlite3
-*.db
-
-# Agent/AI scratch, local-only configs
+# ── Agent and editor scratch space ───────────────────────────────────────────
 .agent/
 .claude/
 scratch/
+.vscode/
+.idea/
+.history/
 
-# Large or sensitive datasets (recommend moving to external storage or git-lfs)
-backend/dataset.csv
-backend/Grocery_Inventory_and_Sales_Dataset.csv
-backend/inventory_1000.csv
-
-# Tests / local test artifacts
-tests/__pycache__/
-
-# Misc junk / scratch files
-c.html
-Porfolio/
-Portfolio/
-prd.md
-project_overview.md
+# ── OS metadata ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
