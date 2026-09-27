@@ -14,23 +14,36 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import BaseModel
 
 from mcp_bridge.client_manager import mcp_manager
 
 from .clarification import clarification_store
 from .intent_schema import (
+    CANONICAL_TOOL,
     INTENT_TOOL,
+    MUTATING_INTENTS,
     SYSTEM_PROMPT_INTENT,
     KNOWN_INTENTS,
     Clarification,
     IntentPlan,
     Rejection,
     build_intent,
+    merge_intent,
+    normalise_intent_name,
     normalise_product_query,
     validate_intent,
 )
+
+import time
 
 log = logging.getLogger(__name__)
 
@@ -712,22 +725,70 @@ async def _execute_routed_request(route: RoutedRequest, user_id: int, tools: lis
 
 _INTENT_MODEL_MAX_TOKENS = 700
 
+# Internal bookkeeping that must never reach the browser.
+_INTERNAL_ROW_KEYS = frozenset({
+    "success", "message", "before", "updated_fields", "product_id",
+    "old_stock", "new_stock", "deleted_id", "error", "needs_clarification",
+    "missing", "tool", "intent", "select_candidate", "user_id",
+})
+_PUBLIC_ROW_KEYS = ("id", "name", "category", "stock", "price", "supplier")
 
-def _intent_error(message: str) -> QueryResponse:
-    """A refusal that never touched the database."""
-    return QueryResponse(
-        answer=message,
-        tool_used=None,
-        data=[{"error": message}],
-    )
+
+def _public_row(row: dict) -> dict:
+    """Keep the useful product columns, drop every internal agent field."""
+    return {key: row[key] for key in _PUBLIC_ROW_KEYS if key in row}
 
 
-def _clarification_response(question: str, clarification: Clarification) -> QueryResponse:
-    return QueryResponse(
-        answer=clarification.question,
-        tool_used=None,
-        data=[{"needs_clarification": True, "missing": list(clarification.missing)}],
-    )
+def _public_rows(rows) -> list[dict]:
+    return [_public_row(r) for r in rows if isinstance(r, dict) and r.get("id") is not None]
+
+
+def _observe(stage: str, **fields) -> None:
+    """Structured, secret-free observability for the intent pipeline."""
+    parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    log.info(f"[INTENT:{stage}] {parts}")
+
+
+def _intent_error(message: str, intent: str = None, stage: str = "rejected") -> QueryResponse:
+    """A refusal that never touched the database. Conversation text only."""
+    _observe(stage, intent=intent, outcome="error")
+    return QueryResponse(answer=message, tool_used=None, data=None)
+
+
+def _clarification_response(clarification: Clarification, intent: str = None) -> QueryResponse:
+    """
+    A question for the user.
+
+    Deliberately carries no data payload: the browser must show the question,
+    not the agent's internal state. The pending intent lives server-side.
+    """
+    _observe("clarification", intent=intent, missing=list(clarification.missing))
+    return QueryResponse(answer=clarification.question, tool_used=None, data=None)
+
+
+_AFFIRMATIVE = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "confirmed",
+    "affirmative", "proceed", "delete", "remove", "go", "ahead",
+}
+_NEGATIVE = {
+    "no", "nope", "nah", "cancel", "stop", "dont", "keep", "abort", "nevermind",
+    "negative", "keepit", "dontdelete",
+}
+# A confirmation reply is expected to be short. Without this, a confused
+# question such as "what do you mean?" would match a stray affirmative word.
+_MAX_CONFIRM_WORDS = 5
+
+
+def _is_affirmative(text: str) -> bool:
+    tokens = re.findall(r"[a-z]+", (text or "").lower())
+    if not tokens or len(tokens) > _MAX_CONFIRM_WORDS:
+        return False
+    return bool(set(tokens) & _AFFIRMATIVE)
+
+
+def _is_negative(text: str) -> bool:
+    tokens = set(re.findall(r"[a-z]+", (text or "").lower()))
+    return bool(tokens & _NEGATIVE)
 
 
 def _build_intent_messages(question: str, pending) -> list[dict]:
@@ -760,21 +821,45 @@ def _build_intent_messages(question: str, pending) -> list[dict]:
 
 
 async def _extract_raw_intent(client: OpenAI, question: str, pending) -> Optional[dict]:
-    """One LLM call. Returns the submit_intent arguments, or None."""
+    """
+    One LLM call, with a single relaxed retry.
+
+    The provider can reject a forced tool_choice when the model declines to
+    emit a tool call (HTTP 400). That must degrade to "no intent" rather than
+    a 500, so it is retried once without the forcing and then given up on.
+    """
     messages = _build_intent_messages(question, pending)
 
-    def _call():
+    def _call(forced: bool):
         return client.chat.completions.create(
             model=MODEL,
             messages=messages,
             tools=[INTENT_TOOL],
-            tool_choice={"type": "function", "function": {"name": "submit_intent"}},
+            tool_choice=(
+                {"type": "function", "function": {"name": "submit_intent"}}
+                if forced else "auto"
+            ),
             parallel_tool_calls=False,
             max_tokens=_INTENT_MODEL_MAX_TOKENS,
         )
 
     loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(None, _call)
+    forced = {"type": "function", "function": {"name": "submit_intent"}}
+    try:
+        response = await loop.run_in_executor(None, _call, True)
+    except BadRequestError as exc:
+        log.warning(f"[INTENT] forced tool_choice rejected ({exc}); retrying unforced")
+        try:
+            response = await loop.run_in_executor(None, _call, False)
+        except Exception as retry_exc:  # noqa: BLE001
+            log.error(f"[INTENT] intent extraction failed: {retry_exc}")
+            return None
+    except (AuthenticationError, NotFoundError, RateLimitError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[INTENT] intent extraction failed: {exc}")
+        return None
+
     msg = response.choices[0].message
 
     if msg.tool_calls:
@@ -827,6 +912,18 @@ async def _resolve_candidates(user_id: int, product_query: str) -> list[dict]:
     ]
 
 
+async def _load_product(user_id: int, product_id) -> Optional[dict]:
+    """Fetch one tenant-owned product row by id, or None."""
+    if product_id is None:
+        return None
+    result = await mcp_manager.call_tool(
+        "get_product_details", {"user_id": user_id, "product_id": int(product_id)}
+    )
+    if isinstance(result, dict) and result.get("id") is not None and not result.get("error"):
+        return result
+    return None
+
+
 def _ambiguity_question(plan: IntentPlan, candidates: list[dict]) -> str:
     """Ask which product, using only names the database actually returned."""
     verb = {
@@ -842,6 +939,20 @@ def _ambiguity_question(plan: IntentPlan, candidates: list[dict]) -> str:
         f"Several products match. Which one should I {verb}? "
         f"Matches: {names}."
     )
+
+
+def _pending_raw(plan: IntentPlan) -> dict:
+    """Raw intent persisted for a backend-raised question.
+
+    The operation and every value already validated must be stored, otherwise
+    merging a follow-up answer would lose what the user already said.
+    """
+    return {
+        "status": "needs_clarification",
+        "intent": plan.intent,
+        "product_queries": list(plan.targets),
+        "changes": dict(plan.changes),
+    }
 
 
 def _narrow_by_user_text(candidates: list[dict], user_text: str) -> Optional[dict]:
@@ -872,7 +983,13 @@ def _narrow_by_user_text(candidates: list[dict], user_text: str) -> Optional[dic
 
 
 async def _execute_intent_plan(plan: IntentPlan, user_id: int, question: str) -> QueryResponse:
-    """Resolve the target if needed, run the single action, render the result."""
+    """
+    Resolve the target if needed, run the single action, render the result.
+
+    Pending state is cleared here on every terminal outcome. Only a question
+    leaves a pending intent behind, so a failed or completed request can never
+    bleed into the user's next, unrelated message.
+    """
     arguments = dict(plan.arguments)
     resolved: Optional[dict] = None
 
@@ -880,9 +997,11 @@ async def _execute_intent_plan(plan: IntentPlan, user_id: int, question: str) ->
         query_text = plan.targets[0] if plan.targets else ""
         candidates = await _resolve_candidates(user_id, query_text) if query_text else []
         if not candidates:
+            clarification_store.clear(user_id)
             return _intent_error(
                 f"No product in your inventory matches '{query_text}'. "
-                "Check the name, or list your products to see what is available."
+                "Check the name, or list your products to see what is available.",
+                plan.intent,
             )
         if len(candidates) > 1:
             narrowed = _narrow_by_user_text(candidates, question)
@@ -898,28 +1017,65 @@ async def _execute_intent_plan(plan: IntentPlan, user_id: int, question: str) ->
                     missing=["product_query"],
                 )
                 clarification_store.save_from_clarification(
-                    user_id, question, {"product_queries": plan.targets},
+                    user_id, question, _pending_raw(plan),
                     plan.intent, clarification,
                 )
                 pending = clarification_store.get(user_id)
                 if pending is not None:
                     pending.candidates = candidates
                     clarification_store.save(user_id, pending)
-                return _clarification_response(question, clarification)
+                return _clarification_response(clarification, plan.intent)
         resolved = candidates[0]
         arguments["product_id"] = resolved["id"]
 
+    # A destructive action is confirmed by the user before it runs, whether the
+    # target was just resolved or was supplied directly.
+    if plan.is_destructive and not plan.confirmed:
+        if resolved is None:
+            resolved = await _load_product(user_id, arguments.get("product_id"))
+            if resolved is None:
+                clarification_store.clear(user_id)
+                return _intent_error(
+                    "No product in your inventory matches that request.",
+                    plan.intent,
+                )
+        question = (
+            f"Delete '{resolved.get('name')}' from your inventory? "
+            "This cannot be undone."
+        )
+        clarification = Clarification(question=question, missing=["confirmation"])
+        clarification_store.save_from_clarification(
+            user_id, question, _pending_raw(plan), plan.intent, clarification,
+        )
+        pending = clarification_store.get(user_id)
+        if pending is not None:
+            pending.stage = "confirm_delete"
+            pending.resolved = dict(resolved)
+            clarification_store.save(user_id, pending)
+        return _clarification_response(clarification, plan.intent)
+
     arguments["user_id"] = user_id
     log.info(f"[INTENT] executing '{plan.tool_name}' args={_redact(arguments)}")
+    exec_started = time.perf_counter()
     result = await mcp_manager.call_tool(plan.tool_name, arguments)
+    exec_ms = int((time.perf_counter() - exec_started) * 1000)
+
+    # The request is settled either way; nothing stays pending.
+    clarification_store.clear(user_id)
 
     if isinstance(result, dict) and result.get("error"):
         error_text = str(result["error"])
         if error_text.startswith(("MCP session", "Tool call failed")):
             raise MCPUnavailableError(f"MCP tool '{plan.tool_name}' failed: {error_text}")
-        return _intent_error(f"{_label(plan)} failed: {error_text}")
+        _observe("execution_failed", intent=plan.intent,
+                 canonical_tool=plan.tool_name, exec_ms=exec_ms)
+        return _intent_error(f"{_label(plan)} failed: {error_text}", plan.intent,
+                             stage="execution_failed")
 
-    return _render_intent_result(plan, result, resolved)
+    response = _render_intent_result(plan, result, resolved)
+    _observe("execution_ok", intent=plan.intent, canonical_tool=plan.tool_name,
+             exec_ms=exec_ms)
+    return response
 
 
 def _redact(arguments: dict) -> dict:
@@ -957,19 +1113,20 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
 
     if plan.kind in ("create", "update", "delete"):
         if not isinstance(result, dict) or result.get("success") is not True or result.get("id") is None:
-            return _intent_error(f"{label} was not confirmed by the database.")
+            return _intent_error(f"{label} was not confirmed by the database.",
+                                 plan.intent, stage="execution_unconfirmed")
         if plan.kind == "create":
             answer = (
-                f"Created '{result['name']}' (ID {result['id']}) in {result['category']} "
-                f"with stock {result['stock']}, price {_format_price(result['price'])}, "
-                f"supplier {result.get('supplier') or 'Unknown'}."
+                f"Created '{result['name']}' in {result['category']} with "
+                f"stock {result['stock']}, price {_format_price(result['price'])}, "
+                f"and supplier {result.get('supplier')}."
             )
         elif plan.kind == "delete":
-            answer = f"Deleted '{result['name']}' (ID {result['id']}) from your inventory."
+            answer = f"Deleted '{result['name']}' from your inventory."
         else:
             if tool == "update_stock":
                 answer = (
-                    f"Updated '{result['name']}' (ID {result['id']}) stock from "
+                    f"Updated '{result['name']}' stock from "
                     f"{result.get('old_stock')} to {result.get('new_stock')}. "
                     f"Price remains {_format_price(result.get('price', 0))}."
                 )
@@ -989,17 +1146,17 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
                             f"category {before.get('category')} → {result.get('category')}"
                         )
                 summary = "; ".join(changed) if changed else "already had the requested values"
-                answer = f"Updated '{result['name']}' (ID {result['id']}): {summary}."
-        return QueryResponse(answer=answer, tool_used=tool, data=[result])
+                answer = f"Updated '{result['name']}': {summary}."
+        return QueryResponse(answer=answer, tool_used=None, data=_public_rows([result]))
 
     # Reads: an empty dict is how get_product_details reports "not found".
     if tool == "get_product_details":
         if not isinstance(result, dict) or not result or result.get("error"):
-            return _intent_error("No product matched that request.")
+            return _intent_error("No product matched that request.", plan.intent)
         return QueryResponse(
             answer=_format_product_read_response([result], _label(plan)),
-            tool_used=tool,
-            data=[result],
+            tool_used=None,
+            data=_public_rows([result]),
         )
 
     rows = _normalize_client_rows(result)
@@ -1007,12 +1164,12 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
         categories = [r.get("value", r) if isinstance(r, dict) else r for r in rows]
         if not categories:
             return QueryResponse(
-                answer="You have no product categories yet.", tool_used=tool, data=rows,
+                answer="You have no product categories yet.", tool_used=None, data=None,
             )
         listing = ", ".join(str(c) for c in categories)
         return QueryResponse(
             answer=f"You have {len(categories)} categories: {listing}.",
-            tool_used=tool,
+            tool_used=None,
             data=rows,
         )
 
@@ -1021,7 +1178,7 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
         if not stats or stats.get("total_products", 0) in (0, None):
             return QueryResponse(
                 answer="Your inventory is empty, so there is nothing to summarise yet.",
-                tool_used=tool,
+                tool_used=None,
                 data=rows,
             )
         answer = (
@@ -1032,12 +1189,12 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
             f"Most expensive: {stats.get('most_expensive')}. "
             f"Cheapest: {stats.get('cheapest')}."
         )
-        return QueryResponse(answer=answer, tool_used=tool, data=rows)
+        return QueryResponse(answer=answer, tool_used=None, data=rows)
 
     if tool == "get_category_analytics":
         if not rows:
             return QueryResponse(
-                answer="You have no product categories yet.", tool_used=tool, data=rows,
+                answer="You have no product categories yet.", tool_used=None, data=rows,
             )
         lines = [
             f"- {r.get('category')}: {r.get('product_count')} products, "
@@ -1046,7 +1203,7 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
             for r in rows if isinstance(r, dict)
         ]
         answer = f"Breakdown across {len(rows)} categories:\n" + "\n".join(lines)
-        return QueryResponse(answer=answer, tool_used=tool, data=rows)
+        return QueryResponse(answer=answer, tool_used=None, data=rows)
 
     answer = _format_product_read_response(rows, _label(plan))
     if not rows and plan.arguments.get("name"):
@@ -1054,19 +1211,55 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
             f"No product in your inventory matches "
             f"'{plan.arguments['name']}'. Check the name or list your products."
         )
-    return QueryResponse(answer=answer, tool_used=tool, data=rows)
+    return QueryResponse(answer=answer, tool_used=None, data=_public_rows(rows))
+
+
+async def _settle_product_from_text(question: str, query_text: str, raw: dict,
+                                    allowed_ids: set[int], user_id: int) -> Optional[IntentPlan]:
+    """
+    Settle a "which product?" question from the database instead of asking.
+
+    The model often asks for disambiguation even when the user's own words are
+    already decisive ("basmati rice 1kg"). Candidate rows come from the database
+    and the tie-break uses only the user's text, so nothing is guessed.
+    """
+    if not query_text:
+        return None
+    candidates = await _resolve_candidates(user_id, query_text)
+    if len(candidates) > 1:
+        narrowed = _narrow_by_user_text(candidates, question)
+        if not isinstance(narrowed, dict):
+            return None
+        candidates = [narrowed]
+    if len(candidates) != 1:
+        return None
+    chosen = candidates[0]
+    merged = dict(raw or {})
+    merged["status"] = "ready"
+    merged["product_queries"] = [str(chosen.get("name"))]
+    merged["product_id"] = int(chosen["id"])
+    settled = build_intent(merged, question)
+    outcome = validate_intent(settled, question, allowed_ids=allowed_ids | {int(chosen["id"])})
+    return outcome if isinstance(outcome, IntentPlan) else None
 
 
 async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> QueryResponse:
-    """Full pipeline: extract -> validate -> resolve -> execute -> render."""
+    """Full pipeline: extract -> merge -> validate -> resolve -> execute -> render."""
     available = {t.get("function", {}).get("name") for t in tools}
     if "query_inventory_db" not in available:
         raise MCPUnavailableError("Inventory MCP tools are not available.")
 
+    started = time.perf_counter()
     pending = clarification_store.get(user_id)
     client = _get_openai_client()
 
+    # A pending delete waits for a yes/no, not for more field values.
+    if pending is not None and pending.stage == "confirm_delete":
+        return await _handle_delete_confirmation(pending, question, user_id, started)
+
+    extract_started = time.perf_counter()
     raw = await _extract_raw_intent(client, question, pending)
+    extract_ms = int((time.perf_counter() - extract_started) * 1000)
     if raw is None:
         clarification_store.clear(user_id)
         return _intent_error(
@@ -1075,24 +1268,47 @@ async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> Que
             "'set the price of Widget to 500'."
         )
 
-    log.info(f"[INTENT] raw={json.dumps(raw, default=str)[:400]}")
     intent = build_intent(raw, question)
 
-    # Ids this request is allowed to reference: digits the user wrote, plus the
-    # rows this backend already fetched for this user while resolving ambiguity.
+    # A follow-up answer completes the pending request; it never replaces it.
+    # The user has however moved on if their message names a different product,
+    # so an abandoned question must not absorb the new request.
+    if pending is not None and pending.raw_intent:
+        pending_targets = {
+            (normalise_product_query(t) or "").lower()
+            for t in (pending.raw_intent.get("product_queries") or [])
+        } - {""}
+        incoming_targets = {
+            (normalise_product_query(t) or "").lower()
+            for t in (intent.product_queries or [])
+        } - {""}
+        pending_intent = normalise_intent_name(pending.raw_intent.get("intent"))
+        incoming_intent = normalise_intent_name(intent.intent)
+
+        moved_on = bool(
+            (pending_intent and incoming_intent and pending_intent != incoming_intent)
+            or (pending_targets and incoming_targets
+                and pending_targets.isdisjoint(incoming_targets))
+        )
+        if moved_on:
+            _observe("pending_abandoned", pending=pending_intent,
+                     incoming=incoming_intent)
+            clarification_store.clear(user_id)
+            pending = None
+        else:
+            merged = merge_intent(pending.raw_intent, raw)
+            intent = build_intent(merged, question)
+            raw = merged
+
     candidates = list(pending.candidates) if pending is not None else []
     allowed_ids = {int(c["id"]) for c in candidates if c.get("id") is not None}
 
-    # If the model picked one of the candidates we offered, use that row
-    # directly. This is how a short answer like "the 5kg one" completes an
-    # ambiguous request without a second round trip.
     if candidates and intent.select_candidate:
         wanted = intent.select_candidate.strip().lower()
         for candidate in candidates:
             if str(candidate.get("name", "")).strip().lower() == wanted:
                 intent.product_id = int(candidate["id"])
                 intent.product_queries = [str(candidate.get("name"))]
-                log.info(f"[INTENT] candidate selected id={candidate['id']}")
                 break
         else:
             return _intent_error(
@@ -1101,10 +1317,39 @@ async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> Que
             )
 
     outcome = validate_intent(intent, question, allowed_ids=allowed_ids)
+    _observe(
+        "validated",
+        intent=intent.intent,
+        result=type(outcome).__name__,
+        extract_ms=extract_ms,
+    )
+
+    if isinstance(outcome, Clarification) and intent.intent in MUTATING_INTENTS:
+        # For a mutation the backend decides what is missing, never the model.
+        # The model often under-reports (asking only for price while supplier
+        # is also absent), which is the bug this replaces.
+        forced = build_intent({**raw, "status": "ready"}, question)
+        recomputed = validate_intent(forced, question, allowed_ids=allowed_ids)
+        if isinstance(recomputed, Clarification):
+            outcome = recomputed
+            _observe("missing_recomputed", intent=intent.intent,
+                     missing=list(recomputed.missing))
+
+    if isinstance(outcome, Clarification):
+        # If the only thing unclear is the product, let the database and the
+        # user's own words settle it rather than asking a needless question.
+        if outcome.missing == ["product_query"] and intent.product_queries:
+            settled = await _settle_product_from_text(
+                question, intent.product_queries[0], raw, allowed_ids, user_id
+            )
+            if settled is not None:
+                _observe("product_settled_from_text", intent=settled.intent,
+                         canonical_tool=settled.tool_name)
+                outcome = settled
 
     if isinstance(outcome, Rejection):
         clarification_store.clear(user_id)
-        return _intent_error(outcome.message)
+        return _intent_error(outcome.message, intent.intent)
 
     if isinstance(outcome, Clarification):
         attempts = pending.attempts if pending is not None else 0
@@ -1112,27 +1357,89 @@ async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> Que
             clarification_store.clear(user_id)
             return _intent_error(
                 "I still need a detail before I can continue. "
-                "Please restate the request with the product name and the value to change."
+                "Please restate the request with the product name and the value to change.",
+                intent.intent,
             )
         clarification_store.save_from_clarification(
             user_id, pending.original_question if pending else question,
             raw, intent.intent, outcome,
         )
-        return _clarification_response(question, outcome)
+        return _clarification_response(outcome, intent.intent)
 
     if outcome.tool_name not in available:
         clarification_store.clear(user_id)
-        return _intent_error(f"Required MCP tool '{outcome.tool_name}' is unavailable.")
+        return _intent_error(
+            f"Required MCP tool '{outcome.tool_name}' is unavailable.", intent.intent
+        )
 
-    log.info(f"[INTENT] plan='{outcome.intent}' tool='{outcome.tool_name}' "
-             f"targets={outcome.targets} args={_redact(outcome.arguments)}")
+    _observe(
+        "planned",
+        intent=outcome.intent,
+        canonical_tool=outcome.tool_name,
+        model_tool=intent.tool,
+        destructive=outcome.is_destructive or None,
+    )
 
     response = await _execute_intent_plan(outcome, user_id, question)
-    # A resolved plan means the request is settled; drop the pending state.
-    if not (response.data and isinstance(response.data[0], dict)
-            and response.data[0].get("needs_clarification")):
-        clarification_store.clear(user_id)
+    _observe(
+        "finished",
+        intent=outcome.intent,
+        canonical_tool=outcome.tool_name,
+        total_ms=int((time.perf_counter() - started) * 1000),
+    )
     return response
+
+
+async def _handle_delete_confirmation(pending, question: str, user_id: int,
+                                      started: float) -> QueryResponse:
+    """Execute a resolved delete only on a clear yes; a no changes nothing."""
+    name = pending.resolved.get("name") or "that product"
+    if _is_negative(question):
+        clarification_store.clear(user_id)
+        _observe("delete_cancelled", intent=pending.intent)
+        return QueryResponse(
+            answer=f"Understood. I did not delete '{name}'.", tool_used=None, data=None,
+        )
+    if not _is_affirmative(question):
+        # Not an answer: keep the pending intent and ask again, concisely.
+        clarification_store.save(user_id, pending)
+        _observe("delete_unanswered", intent=pending.intent)
+        return QueryResponse(
+            answer=(
+                f"I still need a yes or no. Delete '{name}' from your inventory? "
+                "This cannot be undone."
+            ),
+            tool_used=None,
+            data=None,
+        )
+
+    arguments = {"product_id": int(pending.resolved["id"]), "user_id": user_id}
+    result = await mcp_manager.call_tool("delete_product", arguments)
+    if isinstance(result, dict) and result.get("error"):
+        clarification_store.clear(user_id)
+        _observe("delete_failed", intent=pending.intent, canonical_tool="delete_product")
+        return _intent_error(
+            f"Product deletion failed: {result['error']}", pending.intent
+        )
+    if not isinstance(result, dict) or result.get("success") is not True:
+        clarification_store.clear(user_id)
+        _observe("delete_unconfirmed", intent=pending.intent, canonical_tool="delete_product")
+        return _intent_error("Product deletion was not confirmed by the database.",
+                             pending.intent)
+
+    clarification_store.clear(user_id)
+    _observe(
+        "delete_executed",
+        intent=pending.intent,
+        canonical_tool="delete_product",
+        product_id=result.get("id"),
+        total_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return QueryResponse(
+        answer=f"Deleted '{result['name']}' from your inventory.",
+        tool_used=None,
+        data=_public_rows([result]),
+    )
 
 
 async def run_query(question: str, current_user: dict) -> QueryResponse:

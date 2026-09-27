@@ -337,13 +337,23 @@ user text
   -> answer rendered from the committed result
 ```
 
-The model only translates language and, when something is required but absent, asks one short
-follow-up question. It never writes SQL, never invents a product id or database value, and never
-authors the final answer text. All numbers in a response come from the committed MCP result.
+The model only translates language. It never writes SQL, never invents a product id or
+database value, never supplies `user_id`, and never decides the tool — Python maps the
+intent to a canonical MCP tool and ignores a conflicting model-supplied tool name.
 
-If the target product is missing or ambiguous the request stops with a question rather than a
-guess. The pending intent, the original request, and the candidate rows are held per user, so a
-short reply such as `1500` or `the 5kg one` completes the original request.
+If a required value is missing the request stops with **one** question covering **all**
+missing fields, and no value is ever defaulted. For `create_product` that means name,
+category, stock, price, and supplier are all required; there is no `Unknown` fallback.
+A follow-up answer is merged into the pending intent, so `100 rupees, supplier navya`
+completes the original request. If the user names a different product, the pending
+question is abandoned so it cannot swallow the new request.
+
+Destructive actions are resolved first and then confirmed explicitly. A reply that is
+neither clearly yes nor no keeps the question pending; a "no" changes nothing.
+
+Responses contain only conversational text plus, when useful, a table of plain product
+rows. Intent names, tool names, confirmation flags, and success markers are never sent
+to the browser, and the chat UI renders no tool tags.
 
 Set `USE_LLM_INTENT=false` to fall back to the legacy regex router, which is still shipped and
 still covered by tests.
@@ -368,7 +378,7 @@ python -m pip install pytest pytest-asyncio
 python -m pytest -v
 ```
 
-The repository currently defines 149 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, LLM structured-intent extraction, clarification and resume, ambiguity handling, create-versus-restock, multi-target refusal, legacy routing, fuzzy product-name resolution, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The model is stubbed in the automated suite; everything after extraction, including the MCP tools and the database, is real, and the live Docker workflow exercises the real Groq model. There is currently no frontend test or lint command.
+The repository currently defines 162 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, LLM structured-intent extraction, canonical tool mapping, required-field enforcement, clarification and resume, ambiguity handling, delete confirmation and cancellation, create-versus-restock, multi-target refusal, provider-failure fallback, response-sanitization, legacy routing, fuzzy product-name resolution, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The model is stubbed in the automated suite; everything after extraction, including the MCP tools and the database, is real, and the live Docker workflow exercises the real Groq model. There is currently no frontend test or lint command.
 
 Build the frontend with:
 
@@ -433,6 +443,11 @@ StockSync/
 - Chat messages are stored and displayed. The assistant keeps no conversational memory beyond a pending clarification, which is held in process memory and expires after 15 minutes.
 - The pending-clarification store is in-process. With more than one backend replica it must move to shared storage, or a clarification started on one replica will not be visible to another.
 - Product-name ambiguity is resolved from the user's own words only when one candidate is a clear winner; otherwise the assistant asks. It never picks arbitrarily.
+- The model occasionally under-reports a missing field. The backend recomputes the required
+  set for every mutation, so an omitted field is still requested, though the question can
+  sometimes ask for a field the user already gave.
+- The LLM extraction call has no timeout. A slow provider can hold a request for a long time
+  (observed up to ~60s). MCP tool calls are bounded at 30s; the model call is not.
 - A request naming several products for one mutation is refused rather than partially applied.
 - The deterministic legacy regex router is retained only as a fallback behind `USE_LLM_INTENT=false`; it is not the default path.
 - Dashboard value and low-stock analytics are calculated in the browser from at most 200 fetched products and are not authoritative for larger inventories.

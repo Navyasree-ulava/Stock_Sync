@@ -16,11 +16,14 @@ tool, table, or column is introduced.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 # products.stock is a 4-byte integer column; keep in step with mcp_server.
 MAX_STOCK = 2_147_483_647
@@ -75,6 +78,32 @@ MUTATING_INTENTS = frozenset({
 
 DESTRUCTIVE_INTENTS = frozenset({INTENT_DELETE})
 
+# Python owns the intent -> tool mapping. The model may echo a tool name, but a
+# conflicting value is ignored and logged, never executed.
+CANONICAL_TOOL: dict[str, str] = {
+    INTENT_QUERY_INVENTORY: INTENT_QUERY_INVENTORY,
+    INTENT_GET_DETAILS: INTENT_GET_DETAILS,
+    INTENT_CREATE: INTENT_CREATE,
+    INTENT_SEARCH: INTENT_SEARCH,
+    INTENT_LOW_STOCK: INTENT_LOW_STOCK,
+    INTENT_ALL_CATEGORIES: INTENT_ALL_CATEGORIES,
+    INTENT_BY_CATEGORY: INTENT_BY_CATEGORY,
+    INTENT_BY_NAMES: INTENT_BY_NAMES,
+    INTENT_ANALYTICS: INTENT_ANALYTICS,
+    INTENT_CATEGORY_ANALYTICS: INTENT_CATEGORY_ANALYTICS,
+    INTENT_UPDATE_STOCK: INTENT_UPDATE_STOCK,
+    INTENT_UPDATE_PRODUCT: INTENT_UPDATE_PRODUCT,
+    INTENT_DELETE: INTENT_DELETE,
+}
+
+# Fields every mutation needs before it may run. Nothing here is ever defaulted.
+REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    INTENT_CREATE: ("name", "category", "stock", "price", "supplier"),
+    INTENT_UPDATE_STOCK: ("product_query", "stock"),
+    INTENT_UPDATE_PRODUCT: ("product_query", "changes"),
+    INTENT_DELETE: ("product_query", "confirmation"),
+}
+
 SORT_OPTIONS = ("price_asc", "price_desc", "stock_asc", "stock_desc")
 
 # Common phrasings the model may emit for the same capability. Anything not
@@ -126,6 +155,9 @@ class InventoryIntent(BaseModel):
     offset: Optional[int] = None
     # Only honoured when the same digits appear in the user's own message.
     product_id: Optional[int] = None
+    # Untrusted. The model may fill this in, but Python decides the real tool
+    # from CANONICAL_TOOL and overrides any conflict.
+    tool: Optional[str] = None
     # When candidate products were supplied and the user's answer picks one of
     # them, copy that product's name here exactly as given.
     select_candidate: Optional[str] = None
@@ -196,6 +228,13 @@ INTENT_TOOL: dict[str, Any] = {
                     "type": "integer",
                     "description": "Only if the user themselves quoted this id.",
                 },
+                "tool": {
+                    "type": "string",
+                    "description": (
+                        "Optional. The MCP tool you believe fits. The backend "
+                        "decides the real tool itself and ignores a wrong value."
+                    ),
+                },
                 "select_candidate": {
                     "type": "string",
                     "description": (
@@ -262,11 +301,20 @@ INTENT SELECTION
 - get_category_analytics: a per-category breakdown.
 
 ANSWERING A CLARIFICATION
+- The message is an ANSWER to your own question, not a new request. Keep the
+  original operation, the original product, and every value you already have.
+  Add only what the user just supplied, then set status="ready".
+- Example: you asked for price and supplier, the user replies "100 rupees from
+  navya" -> intent="create_product", the SAME product, category and stock as
+  before, changes.price=100, supplier="navya", status="ready".
+- If the reply answers only part of what you asked for, keep the values you
+  have, set status="needs_clarification", and ask ONLY for what is still missing.
+- If the reply supplies nothing usable, repeat your question unchanged.
 - If candidate products were listed for you and the user's reply clearly picks one
   of them (for example "the 5kg one", "the second one", "the cheaper one"), set
   select_candidate to that candidate's name copied exactly, and keep the rest of
   the original intent. Do not reword the product name.
-- Otherwise combine the reply with the original request yourself.
+- Never convert the operation into a different one while completing it.
 
 CLARIFICATION
 - Ask only for what is strictly required, one short question, and keep every other
@@ -305,11 +353,15 @@ class IntentPlan:
 
     intent: str
     kind: str                      # read | create | update | delete | analytics
-    tool_name: str                 # primary MCP tool
+    tool_name: str                 # primary MCP tool, chosen by Python only
     arguments: dict                # tool args WITHOUT user_id and WITHOUT product_id
     targets: list[str]             # product_queries, possibly empty
     needs_product: bool = False    # resolve product_query -> real id first
     is_destructive: bool = False
+    confirmed: bool = False        # destructive action the user has approved
+    # Values already validated for this plan. Kept so a follow-up question can
+    # resume without the user restating them.
+    changes: dict = field(default_factory=dict)
 
 
 IntentOutcome = IntentPlan | Clarification | Rejection
@@ -383,7 +435,63 @@ def normalise_product_query(raw: str) -> Optional[str]:
     return " ".join(tokens).strip() or None
 
 
+_MERGEABLE_TOP_FIELDS = (
+    "category", "supplier", "threshold", "min_price", "max_price",
+    "stock_threshold", "sort_by", "limit", "offset",
+)
+_MERGEABLE_CHANGE_FIELDS = ("stock", "price", "category")
+
+
+def merge_intent(previous: Optional[dict], incoming: Optional[dict]) -> dict:
+    """
+    Fold a follow-up answer into the pending intent.
+
+    A clarification answer must complete the original request, never replace
+    it. Values already extracted are kept; anything the new message supplies
+    wins field by field. The pending operation and its product target are
+    preserved, so a user cannot accidentally redirect a half-finished mutation.
+    """
+    out = dict(previous or {})
+    new = dict(incoming or {})
+
+    # The product target of a pending request is not redirectable by a
+    # follow-up answer. Changing it is only allowed through select_candidate,
+    # which the backend matches against rows it already fetched.
+    if not out.get("product_queries") and new.get("product_queries"):
+        out["product_queries"] = list(new["product_queries"])
+    if new.get("names") and not out.get("names"):
+        out["names"] = list(new["names"])
+    for key in _MERGEABLE_TOP_FIELDS:
+        value = new.get(key)
+        if value is not None:
+            out[key] = value
+
+    changes = dict(out.get("changes") or {})
+    incoming_changes = dict(new.get("changes") or {})
+    for key in _MERGEABLE_CHANGE_FIELDS:
+        if incoming_changes.get(key) is not None:
+            changes[key] = incoming_changes[key]
+    if incoming_changes.get("stock_is_relative") is False:
+        changes["stock_is_relative"] = False
+    out["changes"] = changes
+
+    out["status"] = "ready"
+    # select_candidate is the one sanctioned way to retarget a pending request,
+    # so a follow-up that supplies it must keep it.
+    if new.get("select_candidate"):
+        out["select_candidate"] = new["select_candidate"]
+    for key in ("missing", "clarification_question", "tool"):
+        out.pop(key, None)
+    return out
+
+
 # ── Validation ────────────────────────────────────────────────────────────────
+
+def normalise_intent_name(raw: Optional[str]) -> str:
+    """Alias-resolve an intent name. Used to compare two intents for equality."""
+    name = (raw or "").strip().lower()
+    return INTENT_ALIASES.get(name, name)
+
 
 def build_intent(raw: dict, user_text: str) -> InventoryIntent:
     """Parse the model's function-call arguments into a typed intent."""
@@ -422,6 +530,14 @@ def validate_intent(intent: InventoryIntent, user_text: str,
         return Rejection(
             f"I cannot map that to an inventory action. Supported actions: "
             f"{', '.join(sorted(KNOWN_INTENTS))}."
+        )
+
+    # The model may echo a tool name. Python decides; a conflict is ignored.
+    canonical = CANONICAL_TOOL.get(name)
+    if intent.tool and intent.tool != canonical:
+        log.warning(
+            f"[INTENT] ignoring model-supplied tool '{intent.tool}'; "
+            f"intent '{name}' maps canonically to '{canonical}'"
         )
 
     targets: list[str] = []
@@ -570,6 +686,9 @@ def _plan_create(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
             "Please add one product at a time so each one is confirmed individually."
         )
     category = _clean(intent.category)
+    supplier = _clean(intent.supplier)
+    # Every one of these is genuinely required. Nothing is defaulted, so all
+    # missing values are requested together in a single question.
     missing = []
     if not category:
         missing.append("category")
@@ -577,11 +696,10 @@ def _plan_create(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
         missing.append("stock")
     if intent.changes.price is None:
         missing.append("price")
+    if not supplier:
+        missing.append("supplier")
     if missing:
-        return Clarification(
-            _create_question(name, missing),
-            missing=missing,
-        )
+        return Clarification(_create_question(name, missing), missing=missing)
     return IntentPlan(
         intent=INTENT_CREATE,
         kind="create",
@@ -591,27 +709,35 @@ def _plan_create(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
             "category": category,
             "stock": int(intent.changes.stock),
             "price": round(float(intent.changes.price), 2),
-            "supplier": _clean(intent.supplier) or "Unknown",
+            "supplier": supplier,
         },
         targets=targets,
+        changes={"stock": int(intent.changes.stock),
+                 "price": round(float(intent.changes.price), 2),
+                 "category": category, "supplier": supplier},
     )
 
 
+_CREATE_FIELD_LABELS = {
+    "category": "category",
+    "stock": "stock quantity",
+    "price": "price",
+    "supplier": "supplier",
+}
+
+
 def _create_question(name: str, missing: list[str]) -> str:
-    if missing == ["category"]:
-        return f"Which category should {_quote(name)} be in?"
-    if missing == ["stock"]:
-        return f"How many units of {_quote(name)} should be in stock?"
-    if missing == ["price"]:
-        return f"What price should I set for {_quote(name)}?"
-    parts = []
-    if "category" in missing:
-        parts.append("the category")
-    if "stock" in missing:
-        parts.append("the stock quantity")
-    if "price" in missing:
-        parts.append("the price")
-    return f"Please provide {', '.join(parts)} for {_quote(name)}."
+    """Ask for every missing value at once, in one short question."""
+    labels = [_CREATE_FIELD_LABELS[f] for f in missing if f in _CREATE_FIELD_LABELS]
+    if not labels:
+        return f"Please tell me the details for {_quote(name)}."
+    if len(labels) == 1:
+        return f"What {labels[0]} should I set for {_quote(name)}?"
+    if len(labels) == 2:
+        joined = f"{labels[0]} and {labels[1]}"
+    else:
+        joined = ", ".join(labels[:-1]) + f" and {labels[-1]}"
+    return f"What {joined} should I set for {_quote(name)}?"
 
 
 def _plan_update_stock(intent: InventoryIntent, targets: list[str],
@@ -638,6 +764,7 @@ def _plan_update_stock(intent: InventoryIntent, targets: list[str],
     return IntentPlan(
         intent=INTENT_UPDATE_STOCK, kind="update", tool_name=INTENT_UPDATE_STOCK,
         arguments=arguments, targets=targets, needs_product=product_id is None,
+        changes={"stock": int(intent.changes.stock)},
     )
 
 
@@ -670,9 +797,11 @@ def _plan_update_product(intent: InventoryIntent, targets: list[str],
         )
     if product_id is not None:
         applied["product_id"] = product_id
+    resume_changes = {k: v for k, v in applied.items() if k != "product_id"}
     return IntentPlan(
         intent=INTENT_UPDATE_PRODUCT, kind="update", tool_name=INTENT_UPDATE_PRODUCT,
         arguments=applied, targets=targets, needs_product=product_id is None,
+        changes=resume_changes,
     )
 
 

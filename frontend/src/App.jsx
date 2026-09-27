@@ -316,26 +316,16 @@ export default function App() {
     try {
       const { data } = await axios.post('/query', { question })
       if (generation !== authGenerationRef.current) return
-      // A routed failure returns HTTP 200 with the error inside data[0].
-      // Surface it as an error bubble and only table the candidate rows,
-      // never the { error, matches } envelope itself.
-      const rows = Array.isArray(data.data) ? data.data : null
-      const envelope = rows && rows.length > 0 ? rows[0] : null
-      const routedError = envelope && typeof envelope === 'object' && envelope.error
-        ? String(envelope.error)
-        : null
-      const tableRows = routedError
-        ? (Array.isArray(envelope.matches) && envelope.matches.length > 0 ? envelope.matches : null)
-        : data.data
+      // The backend sends only user-facing text plus, when useful, a table of
+      // product rows. It never sends intent/tool/clarification internals, so
+      // this renders the response as-is.
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         role: 'ai',
         content: data.answer,
-        toolUsed: data.tool_used,
-        data: tableRows,
+        data: data.data,
         userQuery: question, // Store original question to detect intent
         timestamp: new Date(),
-        error: Boolean(routedError),
       }])
       if (wasVoice === true) {
         playTTS(data.answer, generation)

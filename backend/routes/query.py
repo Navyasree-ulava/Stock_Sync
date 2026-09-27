@@ -13,7 +13,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from openai import APIConnectionError, AuthenticationError, NotFoundError, RateLimitError
+from openai import (
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
@@ -114,6 +120,11 @@ async def query_inventory(
     except NotFoundError as exc:
         log.error("[QUERY] Configured Groq model is unavailable", exc_info=True)
         raise HTTPException(status_code=503, detail="The configured AI model is unavailable. Check LLM_MODEL.")
+    except BadRequestError:
+        # The provider rejected the request itself, e.g. it declined a forced
+        # tool call. That is a provider-side failure, not a bad user request.
+        log.error("[QUERY] AI provider rejected the completion request", exc_info=True)
+        raise HTTPException(status_code=503, detail="The AI service could not process that request. Please try again.")
     except RateLimitError:
         raise HTTPException(status_code=429, detail="AI service rate limit reached. Please wait and retry.")
     except (APIConnectionError, AIConfigurationError):

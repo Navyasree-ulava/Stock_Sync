@@ -37,20 +37,32 @@ class PendingIntent:
     missing: list[str] = field(default_factory=list)
     clarification_question: str = ""
     candidates: list[dict] = field(default_factory=list)
+    # "clarify"  = waiting for missing values or a product choice
+    # "confirm_delete" = product resolved, waiting for yes/no
+    stage: str = "clarify"
+    # The database row already resolved for a pending delete confirmation.
+    resolved: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     attempts: int = 0
 
     def to_context(self) -> dict:
-        return {
+        context = {
             "original_request": self.original_question,
             "intent_so_far": self.raw_intent,
             "still_missing": list(self.missing),
-            "candidates": [
-                {"id": c.get("id"), "name": c.get("name"), "category": c.get("category")}
-                for c in self.candidates[:10]
-            ],
             "question_you_asked": self.clarification_question,
         }
+        if self.candidates:
+            context["candidates"] = [
+                {"id": c.get("id"), "name": c.get("name"), "category": c.get("category")}
+                for c in self.candidates[:10]
+            ]
+        if self.stage == "confirm_delete":
+            context["awaiting_confirmation_of"] = {
+                "id": self.resolved.get("id"),
+                "name": self.resolved.get("name"),
+            }
+        return context
 
 
 class ClarificationStore:
