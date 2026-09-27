@@ -13,6 +13,31 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ── Category identity ────────────────────────────────────────────────────────
+# A category's identity is case- and whitespace-insensitive for EVERY category,
+# current or future. The stored value is always the normalized form and a
+# display label is derived from it. Nothing here is category-specific.
+
+DEFAULT_CATEGORY = "general"
+
+
+def normalize_category(value) -> str:
+    """Canonical category identity: trim + lowercase.
+
+    This single strategy is used for comparison, deduplication, grouping,
+    filtering, analytics, validation and storage.
+    """
+    return str(value or "").strip().lower() or DEFAULT_CATEGORY
+
+
+def display_category(value) -> str:
+    """Human-readable label for a normalized category, e.g. 'grains' -> 'Grains'."""
+    normalized = normalize_category(value)
+    if normalized == DEFAULT_CATEGORY:
+        return "General"
+    return normalized.title()
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -41,7 +66,8 @@ class Product(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    category: Mapped[str] = mapped_column(String(100), default="General", nullable=False, index=True)
+    # Default is the normalized identity; the UI shows the display label.
+    category: Mapped[str] = mapped_column(String(100), default=DEFAULT_CATEGORY, nullable=False, index=True)
     stock: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     supplier: Mapped[str] = mapped_column(String(255), default="Unknown", nullable=False)

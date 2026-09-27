@@ -33,6 +33,8 @@ from ai.intent_schema import (
     build_intent,
     merge_intent,
     normalise_product_query,
+    parse_quantity,
+    salvage_missing_create_fields,
     user_stated_ids,
     validate_intent,
 )
@@ -521,7 +523,7 @@ async def test_stock_price_and_category_updates(inventory, scripted):
         ("update the category of Cotton T-Shirt to Clothing",
          {"status": "ready", "intent": "update_product",
           "product_queries": ["Cotton T-Shirt"], "changes": {"category": "Clothing"}},
-         lambda r: r.category == "Clothing"),
+         lambda r: r.category == "clothing"),
     ]:
         scripted([payload])
         response = await _run(question, user_id)
@@ -988,6 +990,186 @@ async def test_new_request_is_not_absorbed_by_a_pending_question(inventory, scri
     assert _product(user_id, sessions, "Full Cream Milk 1L").stock == 40, "pending abandoned"
 
 
+# ── Ask ALL missing required create fields at once ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_missing_stock_and_supplier_asked_together(inventory, scripted):
+    """BUG 2 case 1: never one field at a time."""
+    sessions, user_id = inventory
+    harness = scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["iPhone"], "category": "electronics",
+        "changes": {"price": 100000.0},
+    }, {
+        "status": "ready", "intent": "create_product",
+        "changes": {"stock": 25}, "supplier": "Apple",
+    }])
+
+    first = await _run(
+        "Add a new item to electronics called iPhone with price 100000.", user_id)
+    assert first.data is None
+    answer = first.answer.lower()
+    assert "stock" in answer and "supplier" in answer, first.answer
+    assert first.answer.count("?") == 1
+    pending = clarification_store.get(user_id)
+    assert sorted(pending.missing) == ["stock", "supplier"]
+
+    second = await _run("stock 25 and supplier Apple", user_id)
+    assert harness.mutation_names == ["create_product"]
+    row = _product(user_id, sessions, "iPhone")
+    assert (row.stock, row.price, row.supplier) == (25, 100000.0, "Apple")
+
+
+@pytest.mark.asyncio
+async def test_missing_price_and_supplier_asked_together(inventory, scripted):
+    """BUG 2 case 2."""
+    sessions, user_id = inventory
+    scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Gadget"], "category": "tools",
+        "changes": {"stock": 10},
+    }])
+
+    response = await _run("add a product called Gadget in category Tools with stock 10", user_id)
+    assert response.data is None
+    answer = response.answer.lower()
+    assert "price" in answer and "supplier" in answer, response.answer
+    assert sorted(clarification_store.get(user_id).missing) == ["price", "supplier"]
+
+
+@pytest.mark.asyncio
+async def test_three_missing_fields_asked_together(inventory, scripted):
+    """BUG 2 case 3: category + stock + supplier in one question."""
+    sessions, user_id = inventory
+    scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Widget"], "changes": {"price": 99.0},
+    }, {
+        "status": "ready", "intent": "create_product",
+        "category": "tools", "changes": {"stock": 4}, "supplier": "SRM",
+    }])
+
+    first = await _run("add a product named Widget with price 99", user_id)
+    assert first.data is None
+    answer = first.answer.lower()
+    for field in ("category", "stock", "supplier"):
+        assert field in answer, f"{field} missing from {first.answer!r}"
+    assert first.answer.count("?") == 1
+    assert sorted(clarification_store.get(user_id).missing) == ["category", "stock", "supplier"]
+
+    second = await _run("category tools, stock 4, supplier SRM", user_id)
+    row = _product(user_id, sessions, "Widget")
+    assert row is not None
+    # Stored identity is normalized; the API/UI shows a display label.
+    assert (row.category, row.stock, row.supplier) == ("tools", 4, "SRM")
+    assert "Tools" in second.answer
+    _assert_clean(second)
+
+
+@pytest.mark.asyncio
+async def test_remaining_fields_only_after_partial_answer(inventory, scripted):
+    """BUG 2 case 4: answering one field asks only for the rest."""
+    sessions, user_id = inventory
+    scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Gadget2"], "category": "tools",
+        "changes": {"stock": 10},
+    }, {
+        "status": "ready", "intent": "create_product", "changes": {"price": 500.0},
+    }, {
+        "status": "ready", "intent": "create_product", "supplier": "Acme",
+    }])
+
+    first = await _run("add a product named Gadget2 in category Tools with stock 10", user_id)
+    assert "price" in first.answer.lower() and "supplier" in first.answer.lower()
+
+    second = await _run("price 500", user_id)
+    assert second.data is None
+    second_answer = second.answer.lower()
+    assert "supplier" in second_answer
+    assert "price" not in second_answer, "price was already answered"
+
+    third = await _run("supplier Acme", user_id)
+    row = _product(user_id, sessions, "Gadget2")
+    assert (row.stock, row.price, row.supplier) == (10, 500.0, "Acme")
+    _assert_clean(third)
+
+
+@pytest.mark.asyncio
+async def test_all_fields_present_executes_without_asking(inventory, scripted):
+    """BUG 2 case 5: no question when everything is present."""
+    sessions, user_id = inventory
+    harness = scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Full"], "category": "tools",
+        "changes": {"stock": 3, "price": 25.0}, "supplier": "Acme",
+    }])
+
+    response = await _run(
+        "add a product named Full in category Tools with stock 3 price 25 supplier Acme",
+        user_id)
+    assert harness.mutation_names == ["create_product"]
+    assert response.data is not None
+    _assert_clean(response)
+
+
+@pytest.mark.asyncio
+async def test_stated_value_not_reextracted_by_the_model_is_salvaged(inventory, scripted):
+    """
+    The model can drop a value the user clearly stated. The backend recovers it
+    from the user's own wording instead of asking for it again.
+    """
+    sessions, user_id = inventory
+    # The model extracted only the name and price; the user did state the rest.
+    harness = scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Full2"], "changes": {"price": 25.0},
+    }])
+
+    response = await _run(
+        "add a product named Full2 in category Tools with stock 3 price 25 supplier Acme",
+        user_id)
+
+    assert harness.mutation_names == ["create_product"], response.answer
+    row = _product(user_id, sessions, "Full2")
+    assert row is not None
+    assert (row.category, row.stock, row.price, row.supplier) == ("tools", 3, 25.0, "Acme")
+
+
+@pytest.mark.asyncio
+async def test_salvage_never_invents_a_value_the_user_did_not_state(inventory, scripted):
+    """Salvage only fills gaps; it cannot fabricate a supplier."""
+    sessions, user_id = inventory
+    harness = scripted([{
+        "status": "ready", "intent": "create_product",
+        "product_queries": ["Bare"], "category": "tools",
+        "changes": {"stock": 1, "price": 2.0},
+    }])
+
+    response = await _run("add a product named Bare in category Tools with stock 1 price 2", user_id)
+    assert harness.mutations == []
+    assert "supplier" in response.answer.lower()
+    assert _product(user_id, sessions, "Bare") is None
+
+
+def test_salvage_is_additive_and_validation_normalizes():
+    from ai.intent_schema import build_intent, salvage_missing_create_fields, validate_intent
+
+    raw = {"intent": "create_product", "product_queries": ["X"],
+           "changes": {"stock": 9, "price": 5.0}, "category": "Tools",
+           "supplier": "Given"}
+    out = salvage_missing_create_fields(
+        raw, "add X in category Tools with stock 1 price 5 from Nowhere")
+    # Salvage only fills gaps; it never overwrites what the model supplied.
+    assert out["changes"]["stock"] == 9
+    assert out["changes"]["price"] == 5.0
+    assert out["category"] == "Tools"
+    assert out["supplier"] == "Given"
+    # Normalization of the category is the validator's job, not the salvage's.
+    plan = validate_intent(build_intent(out, "add X"), "add X")
+    assert plan.arguments["category"] == "tools"
+
+
 # ── Pure validation / merge units (no LLM) ───────────────────────────────────
 
 @pytest.mark.parametrize(
@@ -1071,3 +1253,345 @@ def test_narrow_by_user_text_requires_a_clear_winner():
     assert picked is not None and picked["id"] == 1
     assert not isinstance(agent._narrow_by_user_text(candidates, "set basmati rice to 60"), dict)
     assert agent._narrow_by_user_text([{"id": 1, "name": "Only One"}], "anything") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Extraction hardening: number forms, under-extraction recovery, update scoping
+# and provider-failure state. All of it deterministic: the model is scripted to
+# under-report on purpose, and the backend must still be correct.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A model that grabbed only the product, as a weak extraction really behaves.
+def _bare_create(name="iPhone", category=None, **extra):
+    payload = {"intent": "create_product", "product_queries": [name]}
+    if category:
+        payload["category"] = category
+    payload.update(extra)
+    return payload
+
+
+# ── Number and currency forms ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("text,expected_stock,expected_price", [
+    ("add iphone in electronics stock 60 price 100000 supplier apple",
+     60, 100000.0),
+    ("add iphone in electronics stock 60 price 1,00,000 supplier apple",
+     60, 100000.0),
+    ("add iphone in electronics stock 60 price 1,000,000 supplier apple",
+     60, 1000000.0),
+    ("add iphone in electronics stock 60 price 100k supplier apple",
+     60, 100000.0),
+    ("add iphone in electronics stock 60 price 1 lakh supplier apple",
+     60, 100000.0),
+    ("add iphone in electronics stock 60 price 2.5 lakhs supplier apple",
+     60, 250000.0),
+    ("add iphone in electronics stock 60 price 1 crore supplier apple",
+     60, 10000000.0),
+    ("add iphone in electronics price \u20b91,00,000 stock 60 units supplier apple",
+     60, 100000.0),
+    ("add iphone in electronics price rs 500 stock 60 supplier apple",
+     60, 500.0),
+    ("add iphone in electronics price inr 750 stock 12 pcs supplier apple",
+     12, 750.0),
+])
+def test_number_and_currency_forms_recover_exactly(text, expected_stock, expected_price):
+    recovered = salvage_missing_create_fields(_bare_create(category="electronics"), text)
+    assert recovered["changes"]["stock"] == expected_stock
+    assert recovered["changes"]["price"] == pytest.approx(expected_price)
+
+
+def test_parse_quantity_rejects_what_it_does_not_understand():
+    # A parser that guesses would invent inventory values out of thin air.
+    assert parse_quantity("a lot") is None
+    assert parse_quantity("5kg") is None
+    assert parse_quantity("") is None
+    assert parse_quantity(None) is None
+    assert parse_quantity(-3) is None
+    assert parse_quantity("1,00,000") == 100000.0
+
+
+# ── The four required phrasings, with a model that dropped the numbers ───────
+
+@pytest.mark.parametrize("text", [
+    "Add iPhone to electronics, stock 60, price 100000, supplier Apple.",
+    "Create an iPhone in electronics for 100000, 60 units, from Apple.",
+    "Add 60 iPhones to electronics at \u20b9100000 each, supplier Apple.",
+    "Put a new iPhone in Electronics. Apple supplies it. Price is 1 lakh and stock is 60.",
+])
+@pytest.mark.asyncio
+async def test_all_four_phrasings_create_the_same_row(inventory, scripted, text):
+    sessions, user_id = inventory
+    scripted([_bare_create("iPhone", "electronics")])
+    response = await _run(text, user_id)
+    _assert_clean(response)
+    row = _product(user_id, sessions, "iPhone")
+    assert row is not None
+    assert (row.stock, row.price, row.supplier) == (60, 100000.0, "Apple")
+    assert row.category == "electronics"
+
+
+@pytest.mark.asyncio
+async def test_field_order_does_not_matter(inventory, scripted):
+    sessions, user_id = inventory
+    scripted([_bare_create("Widget", "tools")])
+    response = await _run("supplier acme, 5 units, \u20b91,00,000, tools category, widget",
+                         user_id)
+    _assert_clean(response)
+    row = _product(user_id, sessions, "Widget")
+    assert (row.stock, row.price, row.supplier) == (5, 100000.0, "acme")
+
+
+# ── Recovery never steals a labelled value ───────────────────────────────────
+
+def test_labelled_price_is_not_re_read_as_stock():
+    # "price 99" is spoken for; stock must stay missing and be asked for.
+    raw = {"intent": "create_product", "product_queries": ["Widget"],
+           "changes": {"price": 99}}
+    recovered = salvage_missing_create_fields(raw, "add a product named Widget with price 99")
+    assert recovered["changes"]["price"] == 99
+    assert "stock" not in recovered["changes"]
+    assert "supplier" not in recovered
+
+
+def test_product_name_is_not_re_read_as_a_supplier():
+    raw = {"intent": "create_product", "product_queries": ["Widget"],
+           "category": "tools", "changes": {"price": 99}}
+    recovered = salvage_missing_create_fields(
+        raw, "add a product named Widget with price 99")
+    assert "supplier" not in recovered
+
+
+def test_model_values_are_never_overwritten():
+    raw = {"intent": "create_product", "product_queries": ["iPhone"],
+           "category": "electronics", "supplier": "CorrectCorp",
+           "changes": {"stock": 7, "price": 123.0}}
+    text = "add iphone in electronics stock 999 price 999999 supplier WrongCorp"
+    recovered = salvage_missing_create_fields(raw, text)
+    assert recovered["changes"] == {"stock": 7, "price": 123.0}
+    assert recovered["supplier"] == "CorrectCorp"
+
+
+def test_recovery_is_create_only():
+    raw = {"intent": "update_product", "product_queries": ["iPhone"]}
+    assert salvage_missing_create_fields(raw, "price 100000 stock 60") == raw
+
+
+# ── Follow-up merging ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_bare_number_and_supplier_answer_completes_the_create(inventory, scripted):
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+    scripted([
+        _bare_create("iPhone", "electronics", changes={"price": 100000}),
+        _bare_create(),
+    ])
+    first = await _run("Add iPhone to electronics with price 100000.", user_id)
+    assert "stock" in first.answer.lower() and "supplier" in first.answer.lower()
+
+    # "60 and Apple." names both open slots with no keywords at all.
+    second = await _run("60 and Apple.", user_id)
+    _assert_clean(second)
+    row = _product(user_id, sessions, "iPhone")
+    assert (row.stock, row.price, row.supplier) == (60, 100000.0, "Apple")
+
+
+@pytest.mark.asyncio
+async def test_partial_answer_asks_only_for_what_is_left(inventory, scripted):
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+    scripted([
+        _bare_create("iPhone", "electronics", changes={"price": 100000}),
+        _bare_create(),
+        _bare_create(),
+    ])
+    await _run("Add iPhone to electronics with price 100000.", user_id)
+    second = await _run("60", user_id)           # stock only
+    _assert_clean(second)
+    lower = second.answer.lower()
+    assert "supplier" in lower
+    assert "stock" not in lower.split("supplier")[0].replace("what", "")
+
+    third = await _run("Apple", user_id)
+    _assert_clean(third)
+    row = _product(user_id, sessions, "iPhone")
+    assert (row.stock, row.price, row.supplier) == (60, 100000.0, "Apple")
+
+
+@pytest.mark.asyncio
+async def test_earlier_fields_survive_an_unhelpful_follow_up(inventory, scripted):
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+    scripted([
+        _bare_create("iPhone", "electronics", changes={"price": 100000}),
+        {},                                     # the model says nothing useful
+        _bare_create(),
+    ])
+    await _run("Add iPhone to electronics with price 100000.", user_id)
+    await _run("60 and Apple.", user_id)
+    row = _product(user_id, sessions, "iPhone")
+    assert row is not None and row.price == 100000.0
+    assert row.category == "electronics"
+
+
+# ── Update scoping ───────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_update_touches_only_the_named_field(inventory, scripted):
+    sessions, user_id = inventory
+    before = _product(user_id, sessions, "USB-C Hub 7-Port")
+    scripted([{"intent": "update_product", "product_queries": ["USB-C Hub 7-Port"],
+               "changes": {"price": 90000}}])
+    response = await _run("Change USB-C Hub 7-Port price to 90000.", user_id)
+    _assert_clean(response)
+    after = _product(user_id, sessions, "USB-C Hub 7-Port")
+    assert after.price == 90000.0
+    assert after.stock == before.stock
+    assert after.category == before.category
+    assert after.supplier == before.supplier
+
+
+@pytest.mark.asyncio
+async def test_update_with_several_fields_touches_only_those(inventory, scripted):
+    sessions, user_id = inventory
+    scripted([{"intent": "update_product", "product_queries": ["USB-C Hub 7-Port"],
+               "changes": {"stock": 100, "price": 2000}}])
+    response = await _run(
+        "Change USB-C Hub 7-Port stock to 100 and price to 2000.", user_id)
+    _assert_clean(response)
+    after = _product(user_id, sessions, "USB-C Hub 7-Port")
+    assert (after.stock, after.price) == (100, 2000.0)
+
+
+@pytest.mark.asyncio
+async def test_supplier_change_is_reported_not_silently_dropped(inventory, scripted):
+    sessions, user_id = inventory
+    scripted([{"intent": "update_product", "product_queries": ["USB-C Hub 7-Port"],
+               "changes": {"stock": 100, "supplier": "Samsung"}}])
+    response = await _run(
+        "Change USB-C Hub 7-Port stock to 100 and supplier to Samsung.", user_id)
+    _assert_clean(response)
+    after = _product(user_id, sessions, "USB-C Hub 7-Port")
+    assert after.stock == 100                     # the supported part applied
+    assert after.supplier == "TechMart"           # contract cannot change it
+    assert "supplier" in response.answer.lower()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_update_asks_instead_of_inventing(inventory, scripted):
+    sessions, user_id = inventory
+    before = _product(user_id, sessions, "USB-C Hub 7-Port")
+    harness = scripted([{"intent": "update_product",
+                         "product_queries": ["USB-C Hub 7-Port"]}])
+    response = await _run("Update USB-C Hub 7-Port.", user_id)
+    _assert_clean(response)
+    assert response.data is None
+    after = _product(user_id, sessions, "USB-C Hub 7-Port")
+    assert (after.stock, after.price) == (before.stock, before.price)
+    assert harness.mutations == []
+
+
+# ── Reads stay reads ─────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("question,payload", [
+    ("Show all electronics.", {"intent": "get_products_by_category",
+                               "category": "electronics"}),
+    ("What products are in grains?", {"intent": "get_products_by_category",
+                                      "category": "grains"}),
+    ("Show USB-C Hub 7-Port.", {"intent": "get_product_details",
+                                "product_queries": ["USB-C Hub 7-Port"]}),
+    ("Find products supplied by TechMart.", {"intent": "search_inventory",
+                                             "product_queries": ["TechMart"]}),
+    ("Show products with stock below 10.", {"intent": "get_low_stock_items",
+                                            "threshold": 10}),
+])
+@pytest.mark.asyncio
+async def test_natural_language_reads_never_mutate(inventory, scripted, question, payload):
+    sessions, user_id = inventory
+    harness = scripted([payload])
+    response = await _run(question, user_id)
+    _assert_clean(response)
+    assert harness.mutations == []
+    assert harness.tools, "a read tool should still have run"
+
+
+# ── Provider failures ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_provider_failure_creates_no_pending_state(inventory, monkeypatch):
+    from openai import APIError
+
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+
+    def _boom(**kwargs):
+        raise APIError(message="upstream exploded", request=None, body=None)
+
+    monkeypatch.setattr(agent, "_get_openai_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_boom))))
+
+    response = await _run("Add iPhone to electronics stock 60 price 100000 supplier Apple",
+                          user_id)
+    assert response.data is None
+    assert clarification_store.get(user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_creates_no_pending_state(inventory, monkeypatch):
+    import time as _time
+
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+
+    def _hang(**kwargs):
+        _time.sleep(30)          # a provider that never answers
+        return None
+
+    monkeypatch.setattr(agent, "INTENT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(agent, "_get_openai_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_hang))))
+
+    response = await _run("Add iPhone to electronics stock 60 price 100000 supplier Apple",
+                          user_id)
+    assert response.data is None
+    assert clarification_store.get(user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_intent_call_sends_a_bounded_timeout(inventory, scripted, monkeypatch):
+    sessions, user_id = inventory
+    monkeypatch.setattr(agent, "INTENT_TIMEOUT_SECONDS", 12.5)
+    harness = scripted([_bare_create("iPhone", "electronics", changes={"stock": 1})])
+    await _run("Add iPhone to electronics", user_id)
+    assert harness.llm, "the model should have been called"
+    assert harness.llm[0]["timeout"] == 12.5
+
+
+@pytest.mark.asyncio
+async def test_failed_follow_up_does_not_corrupt_a_pending_intent(inventory, scripted, monkeypatch):
+    import httpx
+    from openai import RateLimitError
+
+    sessions, user_id = inventory
+    clarification_store.clear(user_id)
+    scripted([_bare_create("iPhone", "electronics", changes={"price": 100000})])
+    await _run("Add iPhone to electronics with price 100000.", user_id)
+    pending_before = clarification_store.get(user_id)
+    assert pending_before is not None
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    response = httpx.Response(429, request=request)
+
+    def _limited(**kwargs):
+        raise RateLimitError("rate limit reached", response=response, body=None)
+
+    monkeypatch.setattr(agent, "_get_openai_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_limited))))
+    with pytest.raises(RateLimitError):
+        await _run("60 and Apple.", user_id)
+
+    # The provider 429 is not this app's own rate limit, and it must not have
+    # quietly discarded the request the user is halfway through.
+    pending_after = clarification_store.get(user_id)
+    assert pending_after is not None
+    assert pending_after.raw_intent.get("product_queries") == ["iPhone"]

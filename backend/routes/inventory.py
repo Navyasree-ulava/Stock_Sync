@@ -20,7 +20,13 @@ from db.connection import get_db
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, distinct, or_
-from db.models import Product, StockAuditLog, User
+from db.models import (
+    Product,
+    StockAuditLog,
+    User,
+    display_category,
+    normalize_category,
+)
 from utils.import_parser import parse_file_rows, resolve_column_headers, validate_row, detect_dataset_type
 
 log = logging.getLogger(__name__)
@@ -53,7 +59,8 @@ class ProductIngest(BaseModel):
     @field_validator("category")
     @classmethod
     def category_sanitize(cls, v: str) -> str:
-        return (v.strip() or "General")[:100]
+        # Stored category identity is always normalized.
+        return normalize_category(v)[:100]
 
     @field_validator("stock")
     @classmethod
@@ -352,6 +359,10 @@ async def execute_import(
             seen_names.setdefault(name_key, vp)
         valid_prods = list(seen_names.values())
 
+    # Imported rows bypass the Pydantic validators, so normalize here too.
+    for vp in valid_prods:
+        vp["category"] = normalize_category(vp.get("category"))[:100]
+
     inserted_count = 0
     updated_count = 0
     skipped_count = 0
@@ -440,7 +451,8 @@ async def get_inventory_stats(
     stats = db.query(
         func.count(Product.id).label("total_products"),
         func.coalesce(func.sum(Product.stock), 0).label("total_units"),
-        func.count(distinct(Product.category)).label("total_categories")
+        # Count distinct normalized identities, not distinct raw strings.
+        func.count(distinct(func.lower(func.trim(Product.category)))).label("total_categories")
     ).filter(Product.user_id == user_id).first()
 
     return {
@@ -459,8 +471,14 @@ async def get_user_categories(
     Return distinct categories for the current user as a flat list of strings.
     """
     user_id = current_user["id"]
-    rows = db.query(Product.category).distinct().filter(Product.user_id == user_id).order_by(Product.category).all()
-    return [r[0] for r in rows if r[0]]
+    rows = (
+        db.query(func.lower(func.trim(Product.category)))
+        .distinct()
+        .filter(Product.user_id == user_id)
+        .all()
+    )
+    # One entry per normalized identity, shown with a display label.
+    return sorted(display_category(r[0]) for r in rows if r[0])
 
 
 # ── Product CRUD ───────────────────────────────────────────────────────────────
@@ -488,7 +506,7 @@ class ProductUpdate(BaseModel):
     def category_sanitize(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        return (v.strip() or "General")[:100]
+        return normalize_category(v)[:100]
 
     @field_validator("supplier")
     @classmethod
@@ -538,7 +556,9 @@ async def list_products(
         )
     if category.strip():
         query = query.filter(
-            Product.category.ilike(f"%{_escape_like(category.strip())}%", escape="\\")
+            func.lower(func.trim(Product.category)).ilike(
+                f"%{_escape_like(normalize_category(category))}%"
+            )
         )
 
     total = query.count()
@@ -549,7 +569,7 @@ async def list_products(
             "id": p.id,
             "user_id": p.user_id,
             "name": p.name,
-            "category": p.category,
+            "category": display_category(p.category),
             "stock": p.stock,
             "price": p.price,
             "supplier": p.supplier,
@@ -591,7 +611,7 @@ async def create_product(
         "id": new_prod.id,
         "user_id": new_prod.user_id,
         "name": new_prod.name,
-        "category": new_prod.category,
+        "category": display_category(new_prod.category),
         "stock": new_prod.stock,
         "price": new_prod.price,
         "supplier": new_prod.supplier,
@@ -620,7 +640,7 @@ async def update_product(
             "id": existing.id,
             "user_id": existing.user_id,
             "name": existing.name,
-            "category": existing.category,
+            "category": display_category(existing.category),
             "stock": existing.stock,
             "price": existing.price,
             "supplier": existing.supplier
@@ -650,7 +670,7 @@ async def update_product(
         "id": existing.id,
         "user_id": existing.user_id,
         "name": existing.name,
-        "category": existing.category,
+        "category": display_category(existing.category),
         "stock": existing.stock,
         "price": existing.price,
         "supplier": existing.supplier,
@@ -703,7 +723,7 @@ async def get_audit_log(
         StockAuditLog.id,
         StockAuditLog.product_id,
         func.coalesce(Product.name, '(deleted product)').label("product_name"),
-        func.coalesce(Product.category, '').label("category"),
+        func.coalesce(func.lower(func.trim(Product.category)), '').label("category"),
         StockAuditLog.old_stock,
         StockAuditLog.new_stock,
         StockAuditLog.action,
@@ -724,7 +744,8 @@ async def get_audit_log(
             "id": r.id,
             "product_id": r.product_id,
             "product_name": r.product_name,
-            "category": r.category,
+            # A row whose product is gone (or is another tenant's) stays blank.
+            "category": display_category(r.category) if r.category else "",
             "old_stock": r.old_stock,
             "new_stock": r.new_stock,
             "action": r.action,

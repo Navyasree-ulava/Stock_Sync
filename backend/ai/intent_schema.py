@@ -17,16 +17,21 @@ tool, table, or column is introduced.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from db.models import display_category, normalize_category
+
 log = logging.getLogger(__name__)
 
 # products.stock is a 4-byte integer column; keep in step with mcp_server.
 MAX_STOCK = 2_147_483_647
+# Mirrors the MCP layer so a price means the same thing everywhere.
+_PRICE_DECIMALS = 2
 MAX_LIMIT = 10_000
 MAX_TARGETS = 20
 
@@ -131,6 +136,9 @@ class ProductChanges(BaseModel):
     stock: Optional[int] = None
     price: Optional[float] = None
     category: Optional[str] = None
+    # The user asked to change the supplier. `update_product` has no settable
+    # supplier field, so the backend reports this instead of guessing.
+    supplier: Optional[str] = None
     # True when the user asked for a relative change ("add 5 more"). The
     # backend refuses to guess the resulting absolute level.
     stock_is_relative: bool = False
@@ -203,6 +211,13 @@ INTENT_TOOL: dict[str, Any] = {
                         "stock": {"type": "integer"},
                         "price": {"type": "number"},
                         "category": {"type": "string"},
+                        "supplier": {
+                            "type": "string",
+                            "description": (
+                                "New supplier, only when the user asks to change the "
+                                "supplier of an existing product."
+                            ),
+                        },
                         "stock_is_relative": {
                             "type": "boolean",
                             "description": "True for 'add 5 more' style relative changes.",
@@ -362,6 +377,9 @@ class IntentPlan:
     # Values already validated for this plan. Kept so a follow-up question can
     # resume without the user restating them.
     changes: dict = field(default_factory=dict)
+    # Extra sentence appended to the reply (e.g. a requested change the MCP
+    # contract cannot apply). Never an instruction, always user-facing text.
+    note: Optional[str] = None
 
 
 IntentOutcome = IntentPlan | Clarification | Rejection
@@ -384,6 +402,21 @@ def _clean(value: Optional[str]) -> Optional[str]:
         return None
     cleaned = re.sub(r"\s+", " ", str(value)).strip(" \t\r\n,.;:!?\"'")
     return cleaned or None
+
+
+def _normalized_category(value: Optional[str]) -> Optional[str]:
+    """
+    Normalize a category coming from the model, an import, or a pending intent.
+
+    Model casing is never trusted: this always returns the canonical identity
+    (trim + lowercase), so every category behaves the same way.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"\s+", " ", str(value)).strip(" \t\r\n,.;:!?\"'")
+    if not cleaned:
+        return None
+    return normalize_category(cleaned)
 
 
 def _clean_question(value: Optional[str]) -> Optional[str]:
@@ -439,7 +472,7 @@ _MERGEABLE_TOP_FIELDS = (
     "category", "supplier", "threshold", "min_price", "max_price",
     "stock_threshold", "sort_by", "limit", "offset",
 )
-_MERGEABLE_CHANGE_FIELDS = ("stock", "price", "category")
+_MERGEABLE_CHANGE_FIELDS = ("stock", "price", "category", "supplier")
 
 
 def merge_intent(previous: Optional[dict], incoming: Optional[dict]) -> dict:
@@ -601,7 +634,7 @@ def validate_intent(intent: InventoryIntent, user_text: str,
         return IntentPlan(intent=name, kind="read", tool_name=INTENT_ALL_CATEGORIES,
                           arguments={}, targets=[])
     if name == INTENT_BY_CATEGORY:
-        category = _clean(intent.category)
+        category = _normalized_category(intent.category)
         if not category:
             return Clarification("Which category should I list?", missing=["category"])
         return IntentPlan(
@@ -676,6 +709,305 @@ def _validate_price(value: Optional[float]) -> Optional[str]:
         return "Price cannot be negative."
     return None
 
+# ── Number and currency parsing ───────────────────────────────────────────────
+# One parser for every user-written numeric form. Nothing here invents a value:
+# an expression it does not understand returns None.
+
+_MULTIPLIERS = {
+    "k": 1_000, "thousand": 1_000, "thousands": 1_000,
+    "lakh": 100_000, "lakhs": 100_000, "lac": 100_000, "lacs": 100_000,
+    "crore": 10_000_000, "crores": 10_000_000, "cr": 10_000_000,
+}
+# Trailing nouns that carry no numeric meaning.
+_UNIT_WORDS = {
+    "unit", "units", "pc", "pcs", "piece", "pieces", "item", "items",
+    "qty", "quantity", "no", "nos", "each", "x", "rs", "inr",
+}
+_CURRENCY_PREFIX = re.compile(r"(?:\u20b9|rs\.?|inr)", re.IGNORECASE)
+
+
+def parse_quantity(text) -> Optional[float]:
+    """
+    Parse one user-written number.
+
+    Understands 100000, 1,00,000, 1,000,000, Rs 500, \u20b9100000, 100k, 1 lakh,
+    2.5 lakhs, 1 crore, 60 units and 12 pcs. Returns None when the expression is
+    not a plain quantity, so no value is ever guessed.
+    """
+    if text is None:
+        return None
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        number = float(text)
+        return number if math.isfinite(number) and number >= 0 else None
+    raw = str(text).strip().lower()
+    if not raw:
+        return None
+    cleaned = _CURRENCY_PREFIX.sub(" ", raw)
+    cleaned = cleaned.replace(",", "")          # 1,00,000 -> 100000
+    cleaned = re.sub(r"\s+", "", cleaned)
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-z]*)", cleaned)
+    if not match:
+        return None
+    value = float(match.group(1))
+    suffix = match.group(2)
+    if suffix:
+        if suffix in _MULTIPLIERS:
+            value *= _MULTIPLIERS[suffix]
+        elif suffix not in _UNIT_WORDS:
+            return None                        # e.g. "5kg" is not a quantity
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+_SPAN_NUMBER = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)")
+
+
+def _parse_spanned_number(span) -> Optional[float]:
+    """
+    Parse the number at the START of `span`, ignoring any trailing words.
+
+    Recovery patterns capture a little extra text ("5 supplier"), so the tail
+    must not be treated as part of the number. A multiplier word is still
+    honoured when it directly follows the digits, so "1 lakh" stays 100000.
+    """
+    if span is None:
+        return None
+    text = str(span).lower().replace(",", "")
+    match = _SPAN_NUMBER.match(text.lstrip())
+    if not match:
+        return None
+    value = float(match.group(1))
+    suffix = match.group(2)
+    if suffix in _MULTIPLIERS:
+        value *= _MULTIPLIERS[suffix]
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _as_stock(value: Optional[float]) -> Optional[int]:
+    if value is None or not float(value).is_integer():
+        return None
+    number = int(value)
+    return number if 0 <= number <= MAX_STOCK else None
+
+
+# ── Value recovery ───────────────────────────────────────────────────────────
+# This is NOT intent routing. The model has already chosen the operation and
+# the product; these patterns only recover a REQUIRED value the user stated in
+# their own words but the model omitted, so the same question is never asked
+# twice for information already given.
+
+_SALVAGE_TEXT_PATTERNS: dict[str, tuple[re.Pattern, ...]] = {
+    "category": (
+        re.compile(r"\bcategory\s*(?:is|of|=|:)?\s*([A-Za-z][\w&'().-]*)", re.IGNORECASE),
+        re.compile(r"\b(?:in|under|into)\s+(?:the\s+)?([A-Za-z][\w&'().-]*)\s+categor", re.IGNORECASE),
+    ),
+    "supplier": (
+        re.compile(r"\bsuppliers?\s*(?:is|of|=|:)?\s*([A-Za-z0-9][\w&'().-]*)", re.IGNORECASE),
+        re.compile(r"\bfrom\s+([A-Za-z0-9][\w&'().-]*)", re.IGNORECASE),
+        re.compile(r"\b([A-Z][\w&'().-]*)\s+supplies\s+(?:it|them|this)\b", re.IGNORECASE),
+    ),
+}
+
+# Number patterns per field. Each is anchored on a word or currency symbol, so a
+# bare number is never stolen from an unrelated part of the sentence.
+_SALVAGE_NUMBER_PATTERNS: dict[str, tuple[re.Pattern, ...]] = {
+    "stock": (
+        re.compile(r"\b(?:stock|quantity|inventory)\s*(?:is|of|=|:|at)?\s*(\d[\d,]*(?:\.\d+)?\s*[a-z]*)", re.IGNORECASE),
+        re.compile(r"\b(\d[\d,]*)\s*(?:units?|pcs|pieces|qty)\b", re.IGNORECASE),
+        re.compile(r"^\s*(?:add|create|put)\s+(\d[\d,]*)\s+\w+", re.IGNORECASE),
+    ),
+    "price": (
+        re.compile(r"\b(?:price|cost|rate)\s*(?:is|of|=|:|at)?\s*"
+                   r"(?:\u20b9|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?\s*[a-z]*)",
+                   re.IGNORECASE),
+        re.compile(r"\u20b9\s*(\d[\d,]*(?:\.\d+)?\s*[a-z]*)"),
+        re.compile(r"\b(?:at|for)\s*(?:\u20b9|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?\s*[a-z]*)"
+                   r"\s*(?:rupees?|rs\.?)?\s*(?:each|apiece)?\b", re.IGNORECASE),
+    ),
+}
+
+_SALVAGE_STOPWORDS = {
+    "the", "a", "an", "and", "with", "to", "is", "in", "of", "for", "at",
+    "product", "item", "call", "called", "named", "name", "new", "add",
+    "please", "hi", "hello", "it", "that", "this", "each", "apiece", "per",
+    "units", "unit", "pcs", "stock", "quantity", "price", "cost", "rate",
+    "category", "supplier", "supplies", "rupees", "rs", "lakh", "lakhs",
+    "crore", "crores", "k", "thousand", "make", "set", "update", "change",
+}
+
+
+def _salvage_text(field_name: str, text: str) -> Optional[str]:
+    for pattern in _SALVAGE_TEXT_PATTERNS.get(field_name, ()):
+        match = pattern.search(text or "")
+        if not match:
+            continue
+        candidate = match.group(1).strip(" ,.;:?!'\"")
+        if not candidate or candidate.lower() in _SALVAGE_STOPWORDS:
+            continue
+        if field_name == "category":
+            return normalize_category(candidate)
+        return candidate[:100]
+    return None
+
+
+def _salvage_number(field_name: str, text: str) -> Optional[float]:
+    for pattern in _SALVAGE_NUMBER_PATTERNS.get(field_name, ()):
+        for match in pattern.finditer(text or ""):
+            value = _parse_spanned_number(match.group(1))
+            if value is not None:
+                return value
+    return None
+
+
+def _all_numbers(text: str) -> list[float]:
+    found = []
+    for token in re.findall(r"\d[\d,]*(?:\.\d+)?\s*[a-z]*", text or "", flags=re.IGNORECASE):
+        value = _parse_spanned_number(token)
+        if value is not None:
+            found.append(value)
+    return found
+
+
+def _salvage_bare_number(field_name: str, text: str) -> Optional[float]:
+    """
+    Use an unanchored number, but only when this is the single numeric slot the
+    backend is waiting on. The slot comes from OUR question, not a model guess.
+    """
+    numbers = _all_numbers(text)
+    if len(numbers) == 1:
+        return numbers[0]
+    return None
+
+
+def _any_anchored_number(text: str) -> bool:
+    """
+    True when the text already spells out a number against a field name.
+
+    If it does, every number in the sentence is already spoken for, so no
+    unanchored number may be reassigned to another slot. This is what stops
+    'a product with price 99' from also being read as stock 99.
+    """
+    return any(
+        _salvage_number(field, text) is not None
+        for field in ("stock", "price")
+    )
+
+
+def _salvage_bare_supplier(text: str) -> Optional[str]:
+    """A short answer like '60 and Apple.' names the supplier without a label."""
+    tokens = re.findall(r"[A-Za-z][\w&'().-]*", text or "")
+    if not tokens:
+        return None
+    candidates = [t for t in tokens if t.lower() not in _SALVAGE_STOPWORDS]
+    if len(candidates) != 1:
+        return None
+    return candidates[0].strip(" ,.;:?!'\"")[:100] or None
+
+
+def _bare_supplier_allowed(text: str, raw: dict) -> bool:
+    """
+    Guard the unlabelled-supplier read.
+
+    It only applies to a short reply to our own question, and never to a fresh
+    product description, where the one leftover word is far more likely to be
+    the product name than a supplier.
+    """
+    words = (text or "").split()
+    if len(words) > 4:
+        return False
+    # Reject a sentence that describes a new product rather than answering us.
+    if re.search(
+        r"\b(?:add|create|new|put|named|called|product|item)\b",
+        text or "", re.IGNORECASE,
+    ):
+        return False
+    known = {
+        (normalise_product_query(q) or "").lower()
+        for q in (raw.get("product_queries") or [])
+    } | {(raw.get("category") or "").lower()}
+    known.discard("")
+    candidates = [
+        t for t in re.findall(r"[A-Za-z][\w&'().-]*", text or "")
+        if t.lower() not in _SALVAGE_STOPWORDS
+    ]
+    # The single leftover word must not be the product or the category.
+    return all(t.lower() not in known for t in candidates)
+
+
+def present_create_fields(raw: dict) -> set[str]:
+    """The REQUIRED_FIELDS that are actually present in the accumulated intent."""
+    changes = raw.get("changes") or {}
+    present: set[str] = set()
+    if raw.get("product_queries"):
+        present.add("name")
+    if _normalized_category(raw.get("category")):
+        present.add("category")
+    if changes.get("stock") is not None:
+        present.add("stock")
+    if changes.get("price") is not None:
+        present.add("price")
+    if _clean(raw.get("supplier")):
+        present.add("supplier")
+    return present
+
+
+def salvage_missing_create_fields(raw: dict, user_text: str) -> dict:
+    """
+    Fill required create fields that the user stated but the model omitted.
+
+    Only ever ADDS values the user wrote themselves. It never changes the
+    operation, the product, or a value the model did supply, and it never
+    invents a value the user did not provide.
+    """
+    if normalise_intent_name(raw.get("intent")) != INTENT_CREATE:
+        return raw
+    if not user_text:
+        return raw
+
+    salvaged = dict(raw)
+    changes = dict(salvaged.get("changes") or {})
+    missing = set(REQUIRED_FIELDS[INTENT_CREATE]) - present_create_fields(salvaged)
+    # At most one numeric slot may be filled from an unanchored number, and only
+    # when the sentence has not already labelled a number with a field name.
+    open_numeric = missing & {"stock", "price"}
+    if open_numeric and _any_anchored_number(user_text):
+        open_numeric = set()
+
+    if "stock" in missing:
+        value = _salvage_number("stock", user_text)
+        if value is None and open_numeric == {"stock"}:
+            value = _salvage_bare_number("stock", user_text)
+        stock_value = _as_stock(value) if value is not None else None
+        if stock_value is not None:
+            changes["stock"] = stock_value
+            open_numeric.discard("stock")
+
+    if "price" in missing:
+        value = _salvage_number("price", user_text)
+        if value is None and open_numeric == {"price"}:
+            value = _salvage_bare_number("price", user_text)
+        if value is not None and math.isfinite(value) and value >= 0:
+            changes["price"] = round(value, _PRICE_DECIMALS)
+            open_numeric.discard("price")
+
+    if "category" in missing:
+        value = _salvage_text("category", user_text)
+        if value:
+            salvaged["category"] = value
+
+    if "supplier" in missing:
+        value = _salvage_text("supplier", user_text)
+        if value is None and _bare_supplier_allowed(user_text, raw):
+            value = _salvage_bare_supplier(user_text)
+        if value:
+            salvaged["supplier"] = value
+
+    salvaged["changes"] = changes
+    return salvaged
+
 
 def _plan_create(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
     if not targets:
@@ -685,7 +1017,7 @@ def _plan_create(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
         return Rejection(
             "Please add one product at a time so each one is confirmed individually."
         )
-    category = _clean(intent.category)
+    category = _normalized_category(intent.category)
     supplier = _clean(intent.supplier)
     # Every one of these is genuinely required. Nothing is defaulted, so all
     # missing values are requested together in a single question.
@@ -781,28 +1113,39 @@ def _plan_update_product(intent: InventoryIntent, targets: list[str],
         subject = _quote(targets[0]) if targets else "that product"
         return Clarification(f"What should the new stock level be for {subject}?",
                              missing=["stock"])
+    # A supplier change is requested but not settable through the MCP contract.
+    unsupported = _clean(changes.supplier)
     applied = {}
     if changes.stock is not None:
         applied["new_stock"] = int(changes.stock)
     if changes.price is not None:
         applied["new_price"] = round(float(changes.price), 2)
-    category = _clean(changes.category)
+    category = _normalized_category(changes.category)
     if category:
         applied["new_category"] = category[:100]
     if not applied:
+        if unsupported:
+            return Rejection(
+                "Supplier cannot be changed after a product is created. "
+                "You can change its stock, price, or category instead."
+            )
         subject = _quote(targets[0]) if targets else "that product"
         return Clarification(
-            f"What would you like to change about {subject} — its stock, price, or category?",
+            f"What would you like to change about {subject} - its stock, price, or category?",
             missing=["changes"],
         )
     if product_id is not None:
         applied["product_id"] = product_id
     resume_changes = {k: v for k, v in applied.items() if k != "product_id"}
-    return IntentPlan(
+    plan = IntentPlan(
         intent=INTENT_UPDATE_PRODUCT, kind="update", tool_name=INTENT_UPDATE_PRODUCT,
         arguments=applied, targets=targets, needs_product=product_id is None,
         changes=resume_changes,
     )
+    if unsupported:
+        plan.note = (f"Supplier was not changed: the supplier for a product cannot be "
+                     f"edited after creation.")
+    return plan
 
 
 def _plan_delete(intent: InventoryIntent, targets: list[str],
@@ -839,7 +1182,7 @@ def _plan_search(intent: InventoryIntent, targets: list[str]) -> IntentOutcome:
     arguments: dict[str, Any] = {}
     if targets:
         arguments["name"] = targets[0]
-    category = _clean(intent.category)
+    category = _normalized_category(intent.category)
     if category:
         arguments["category"] = category
     if intent.min_price is not None:

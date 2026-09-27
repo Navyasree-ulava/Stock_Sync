@@ -545,8 +545,7 @@ async def test_create_request_routes_once_with_typed_values(routing_mocks):
         "success": True,
         "id": 31,
         "name": "Buttermilk",
-        "category": "Dairy",
-        "stock": 1,
+        "category": "dairy",        "stock": 1,
         "price": 250.0,
         "supplier": "SRM",
     }
@@ -559,8 +558,7 @@ async def test_create_request_routes_once_with_typed_values(routing_mocks):
         "create_product",
         {
             "name": "Buttermilk",
-            "category": "Dairy",
-            "stock": 1,
+            "category": "dairy",            "stock": 1,
             "price": 250.0,
             "supplier": "SRM",
             "user_id": 42,
@@ -588,7 +586,7 @@ async def test_category_request_uses_one_tool_and_preserves_price(routing_mocks)
     assert routing_mocks.await_count == 1
     routing_mocks.assert_awaited_once_with(
         "get_products_by_category",
-        {"category": "Electronics", "user_id": 42},
+        {"category": "electronics", "user_id": 42},
     )
     assert result.tool_used == "get_products_by_category"
     assert len(result.data) == 1
@@ -623,15 +621,15 @@ def test_delete_name_does_not_treat_like_wildcards_as_data(mcp_sessions):
     [
         (
             "add a product called Gadget in category Tools with stock 10 and price 500",
-            {"tool": "create_product", "name": "Gadget", "category": "Tools", "stock": 10, "price": 500.0},
+            {"tool": "create_product", "name": "Gadget", "category": "tools", "stock": 10, "price": 500.0},
         ),
         (
             "insert product Lamp in the Home category with price 900 and stock 4",
-            {"tool": "create_product", "name": "Lamp", "category": "Home", "stock": 4, "price": 900.0},
+            {"tool": "create_product", "name": "Lamp", "category": "home", "stock": 4, "price": 900.0},
         ),
         (
             "add product Cable with category Electronics and stock 5 and price 1,499.50 and supplier SRM",
-            {"tool": "create_product", "name": "Cable", "category": "Electronics", "stock": 5, "price": 1499.50},
+            {"tool": "create_product", "name": "Cable", "category": "electronics", "stock": 5, "price": 1499.50},
         ),
     ],
 )
@@ -649,11 +647,11 @@ def test_create_router_handles_prepositions_and_thousands_separators(question, e
         # Numbers written before the noun: "with 25 stock at 45 rupees from Amul".
         (
             "add a product Buttermilk 1L in category Dairy with 25 stock at 45 rupees from Amul",
-            {"name": "Buttermilk 1L", "category": "Dairy", "stock": 25, "price": 45.0, "supplier": "Amul"},
+            {"name": "Buttermilk 1L", "category": "dairy", "stock": 25, "price": 45.0, "supplier": "Amul"},
         ),
         (
             "add Green Tea 250g in category Beverages with stock 30 at 199 rupees",
-            {"name": "Green Tea 250g", "category": "Beverages", "stock": 30, "price": 199.0},
+            {"name": "Green Tea 250g", "category": "beverages", "stock": 30, "price": 199.0},
         ),
     ],
 )
@@ -672,7 +670,7 @@ def test_category_only_change_routes_to_update_product():
     assert route.tool_name == "update_product"
     assert route.validation_error is None
     assert route.arguments["product_name"] == "Cotton T-Shirt"
-    assert route.arguments["new_category"] == "Clothing"
+    assert route.arguments["new_category"] == "clothing"
     assert route.arguments["new_stock"] is None
     assert route.arguments["new_price"] is None
 
@@ -690,7 +688,7 @@ def test_category_locator_is_never_read_as_a_category_change():
         "update the category of Widget to Electronics and price to 99"
     )
     assert combined.tool_name == "update_product"
-    assert combined.arguments["new_category"] == "Electronics"
+    assert combined.arguments["new_category"] == "electronics"
     assert combined.arguments["new_price"] == 99.0
     assert combined.arguments["new_stock"] is None
 
@@ -811,8 +809,7 @@ async def test_update_and_delete_routes_each_execute_once(routing_mocks):
         "success": True,
         "id": 31,
         "name": "Buttermilk",
-        "category": "Dairy",
-        "stock": 1,
+        "category": "dairy",        "stock": 1,
         "price": 250.0,
         "supplier": "SRM",
     }

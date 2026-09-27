@@ -32,7 +32,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from db.connection import SessionLocal
-from db.models import Product, StockAuditLog, User
+from db.models import (
+    Product,
+    StockAuditLog,
+    User,
+    display_category,
+    normalize_category,
+)
 
 # ─── Logging ─────────────────────────────────────────────────
 logging.basicConfig(
@@ -63,7 +69,8 @@ def _serialize(p: Product) -> dict:
     return {
         "id": p.id,
         "name": p.name,
-        "category": p.category,
+        # The stored value is normalized; the API shows a display label.
+        "category": display_category(p.category),
         "stock": p.stock,
         "price": float(p.price),
         "supplier": p.supplier,
@@ -281,7 +288,8 @@ def create_product(
 ) -> dict:
     """Insert exactly one product for the authenticated user's inventory."""
     normalized_name = (name or "").strip()
-    normalized_category = (category or "General").strip() or "General"
+    # Stored category identity is always the normalized form.
+    normalized_category = normalize_category(category)[:100]
     normalized_supplier = (supplier or "Unknown").strip() or "Unknown"
 
     if not normalized_name:
@@ -391,7 +399,12 @@ def search_inventory(
         if name:
             query = query.filter(Product.name.ilike(f"%{_escape_like(name)}%", escape="\\"))
         if category:
-            query = query.filter(Product.category.ilike(f"%{_escape_like(category)}%", escape="\\"))
+            # Category identity is normalized, so this matches regardless of casing.
+            query = query.filter(
+                Product.category.ilike(
+                    f"%{_escape_like(normalize_category(category))}%", escape="\\"
+                )
+            )
         if max_price is not None:
             query = query.filter(Product.price <= max_price)
         if min_price is not None:
@@ -448,20 +461,22 @@ def get_low_stock_items(user_id: int, threshold: int = 10) -> list[dict]:
 def get_all_categories(user_id: int) -> list[str]:
     """
     Return a sorted list of all distinct product categories for the authenticated user.
+
+    Values that differ only by case or surrounding whitespace are ONE category.
+    Labels are returned in display form, e.g. 'grains' -> 'Grains'.
     Use this when the user asks what categories are available.
     """
     log.info(f"[DB] get_all_categories | user_id={user_id}")
     db = _get_db()
     try:
         rows = (
-            db.query(Product.category)
+            db.query(func.lower(func.trim(Product.category)))
             .filter(Product.user_id == user_id)
             .distinct()
-            .order_by(Product.category)
             .all()
         )
-        result = [r[0] for r in rows]
-        log.info(f"[DB] get_all_categories | {len(result)} categories")
+        result = sorted(display_category(r[0]) for r in rows if r[0])
+        log.info(f"[DB] get_all_categories | {len(result)} categories: {result}")
         return result
     finally:
         db.close()
@@ -483,7 +498,10 @@ def get_products_by_category(user_id: int, category: str) -> list[dict]:
             db.query(Product)
             .filter(
                 Product.user_id == user_id,
-                Product.category.ilike(f"%{_escape_like(category)}%", escape="\\"),
+                # Normalized identity: any casing of the same category matches.
+                func.lower(func.trim(Product.category)).ilike(
+                    f"%{_escape_like(normalize_category(category))}%", escape="\\"
+                ),
             )
             .order_by(Product.name)
             .all()
@@ -595,26 +613,29 @@ def get_category_analytics(user_id: int) -> list[dict]:
     """
     Per-category breakdown for the authenticated user:
     product count, total stock, avg price.
+    Grouped by normalized category identity, so values differing only by case or
+    surrounding whitespace are counted as one category.
     Ordered by product count descending.
     """
     log.info(f"[DB] get_category_analytics | user_id={user_id}")
     db = _get_db()
     try:
+        normalized_category = func.lower(func.trim(Product.category))
         rows = (
             db.query(
-                Product.category,
+                normalized_category.label("category"),
                 func.count(Product.id).label("product_count"),
                 func.coalesce(func.sum(Product.stock), 0).label("total_stock"),
                 func.avg(Product.price).label("avg_price"),
             )
             .filter(Product.user_id == user_id)
-            .group_by(Product.category)
+            .group_by(normalized_category)
             .order_by(func.count(Product.id).desc())
             .all()
         )
         result = [
             {
-                "category": r.category,
+                "category": display_category(r.category),
                 "product_count": r.product_count,
                 "total_stock": int(r.total_stock),
                 "avg_price": round(float(r.avg_price), 2) if r.avg_price else 0.0,
@@ -761,9 +782,11 @@ def update_product(
         if price_value is not None and price_value != float(target.price):
             target.price = float(price_value)
             updated_fields.append("price")
-        if new_category is not None and new_category.strip() != target.category:
-            target.category = new_category.strip()[:100]
-            updated_fields.append("category")
+        if new_category is not None:
+            normalized_new_category = normalize_category(new_category)[:100]
+            if normalized_new_category != normalize_category(target.category):
+                target.category = normalized_new_category
+                updated_fields.append("category")
 
         if not updated_fields:
             return {

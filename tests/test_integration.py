@@ -662,6 +662,114 @@ class TestLikeWildcardEscaping:
         assert any(p["name"] == "50% Off" for p in resp.json()["products"])
 
 
+class TestCategoryCaseInsensitivity:
+    """Category identity is trim+lowercase for every category, not just 'Grains'."""
+
+    CASINGS = ["Grains", "grains", "GRAINS", " Grains "]
+    OTHER = ["Electronics", "ELECTRONICS", " electronics "]
+    DAIRY = ["Dairy", "DAIRY", "dairy"]
+
+    def _fresh(self, client, email):
+        headers = _register_and_login(client, "catuser", email)
+        client.post("/inventory/ingest", headers=headers, json={
+            "mode": "replace", "products": [],
+        })
+        return headers
+
+    def test_create_normalizes_and_returns_a_display_label(self, client):
+        headers = self._fresh(client, "cat-create@example.com")
+        for i, variant in enumerate(self.CASINGS):
+            resp = client.post("/inventory/products", headers=headers, json={
+                "name": f"Rice {i}", "category": variant,
+                "stock": 10, "price": 100.0, "supplier": "S"})
+            assert resp.status_code == 201, resp.text
+            assert resp.json()["category"] == "Grains", variant
+
+    def test_filter_matches_every_casing(self, client):
+        headers = self._fresh(client, "cat-filter@example.com")
+        for i, variant in enumerate(self.CASINGS):
+            client.post("/inventory/products", headers=headers, json={
+                "name": f"Rice {i}", "category": variant, "stock": 1, "price": 1.0})
+        for i, variant in enumerate(self.OTHER):
+            client.post("/inventory/products", headers=headers, json={
+                "name": f"Hub {i}", "category": variant, "stock": 1, "price": 1.0})
+
+        for variant in self.CASINGS + ["gRaInS", " GrAiNs "]:
+            resp = client.get("/inventory/products", headers=headers,
+                              params={"category": variant, "per_page": 50})
+            assert resp.status_code == 200
+            assert resp.json()["total"] == len(self.CASINGS), variant
+            assert {p["category"] for p in resp.json()["products"]} == {"Grains"}
+
+    def test_categories_endpoint_returns_one_label_per_identity(self, client):
+        headers = self._fresh(client, "cat-list@example.com")
+        for i, variant in enumerate(self.CASINGS + self.DAIRY):
+            client.post("/inventory/products", headers=headers, json={
+                "name": f"P{i}", "category": variant, "stock": 1, "price": 1.0})
+        assert client.get("/inventory/categories", headers=headers).json() == ["Dairy", "Grains"]
+
+    def test_stats_counts_distinct_identities(self, client):
+        headers = self._fresh(client, "cat-stats@example.com")
+        for i, variant in enumerate(self.CASINGS):
+            client.post("/inventory/products", headers=headers, json={
+                "name": f"R{i}", "category": variant, "stock": 1, "price": 1.0})
+        client.post("/inventory/products", headers=headers, json={
+            "name": "M", "category": "DaIrY", "stock": 1, "price": 1.0})
+        stats = client.get("/inventory/stats", headers=headers).json()
+        assert stats["total_products"] == len(self.CASINGS) + 1
+        assert stats["total_categories"] == 2, stats
+
+    def test_update_normalizes_and_detects_a_real_change(self, client):
+        headers = self._fresh(client, "cat-update@example.com")
+        created = client.post("/inventory/products", headers=headers, json={
+            "name": "Hub", "category": "Electronics", "stock": 1, "price": 1.0}).json()
+        same = client.put(f"/inventory/products/{created['id']}", headers=headers,
+                          json={"category": "  ELECTRONICS  "})
+        assert same.json()["category"] == "Electronics"
+        cats = client.get("/inventory/categories", headers=headers).json()
+        assert cats == ["Electronics"]
+
+        moved = client.put(f"/inventory/products/{created['id']}", headers=headers,
+                           json={"category": "GADGETS"})
+        assert moved.json()["category"] == "Gadgets"
+        assert client.get("/inventory/categories", headers=headers).json() == ["Gadgets"]
+
+    def test_import_normalizes_categories(self, client):
+        headers = self._fresh(client, "cat-import@example.com")
+        csv_body = (
+            "Product Name,Category,Stock Quantity,Price,Supplier\n"
+            "Alpha,Grains,10,100.0,S\n"
+            "Beta,grains,10,200.0,S\n"
+            "Gamma,GRAINS,10,300.0,S\n"
+        )
+        resp = client.post(
+            "/inventory/import", headers=headers,
+            files={"file": ("inv.csv", csv_body, "text/csv")},
+            data={
+                "strategy": "skip",
+                "mappings": '{"name": "Product Name", "stock": "Stock Quantity", '
+                            '"category": "Category", "price": "Price", "supplier": "Supplier"}',
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert client.get("/inventory/categories", headers=headers).json() == ["Grains"]
+        listed = client.get("/inventory/products", headers=headers,
+                            params={"per_page": 50}).json()["products"]
+        assert {p["category"] for p in listed} == {"Grains"}
+
+    def test_tenant_isolation_survives_normalization(self, client):
+        headers_a = self._fresh(client, "cat-iso-a@example.com")
+        headers_b = _register_and_login(client, "catb", "cat-iso-b@example.com")
+        client.post("/inventory/products", headers=headers_a, json={
+            "name": "Mine", "category": "Grains", "stock": 1, "price": 1.0})
+        client.post("/inventory/products", headers=headers_b, json={
+            "name": "Theirs", "category": "grains", "stock": 1, "price": 1.0})
+        a = client.get("/inventory/products", headers=headers_a, params={"per_page": 50}).json()
+        b = client.get("/inventory/products", headers=headers_b, params={"per_page": 50}).json()
+        assert {p["name"] for p in a["products"]} == {"Mine"}
+        assert {p["name"] for p in b["products"]} == {"Theirs"}
+
+
 class TestAuditLogTenantIsolation:
     """Regression: the audit outer join leaked another user's product name."""
 

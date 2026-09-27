@@ -25,6 +25,7 @@ from openai import (
 from pydantic import BaseModel
 
 from mcp_bridge.client_manager import mcp_manager
+from db.models import display_category, normalize_category
 
 from .clarification import clarification_store
 from .intent_schema import (
@@ -40,6 +41,7 @@ from .intent_schema import (
     merge_intent,
     normalise_intent_name,
     normalise_product_query,
+    salvage_missing_create_fields,
     validate_intent,
 )
 
@@ -64,6 +66,11 @@ USE_LLM_INTENT: bool = os.environ.get("USE_LLM_INTENT", "true").strip().lower() 
 # Stop asking follow-up questions after this many rounds so a user who cannot
 # fill the gap gets a clear instruction instead of an endless loop.
 MAX_CLARIFICATIONS: int = int(os.environ.get("LLM_MAX_CLARIFICATIONS", "3"))
+
+# Hard bound on one intent-extraction call. A provider that hangs must not hold
+# the request open indefinitely, and it must not leave pending clarification
+# state behind: the caller treats a timeout exactly like a failed extraction.
+INTENT_TIMEOUT_SECONDS: float = float(os.environ.get("LLM_INTENT_TIMEOUT", "30"))
 
 PRODUCT_READ_TOOLS = {
     "query_inventory_db",
@@ -135,10 +142,19 @@ def _clean_name(value: str) -> str:
 
 
 def _clean_category(value: str) -> str:
+    """
+    Canonical category identity for LLM-extracted categories.
+
+    The model's casing is never trusted: the value is normalized (trim +
+    lowercase) so 'Grains', 'grains' and ' Grains ' are one category. The
+    display label is derived separately.
+    """
     value = re.sub(r"^(?:the|my)\s+", "", value.strip(), flags=re.IGNORECASE)
     value = re.sub(r"\s+category$", "", value, flags=re.IGNORECASE)
     value = value.strip(" ,.;:?")
-    return value.title() if value.islower() else value
+    if not value:
+        return ""
+    return normalize_category(value)
 
 
 # A field noun can end up glued to the product name when the user writes
@@ -841,20 +857,34 @@ async def _extract_raw_intent(client: OpenAI, question: str, pending) -> Optiona
             ),
             parallel_tool_calls=False,
             max_tokens=_INTENT_MODEL_MAX_TOKENS,
+            timeout=INTENT_TIMEOUT_SECONDS,
         )
 
-    loop = asyncio.get_running_loop()
-    forced = {"type": "function", "function": {"name": "submit_intent"}}
+    async def _attempt(forced: bool):
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _call, forced),
+            timeout=INTENT_TIMEOUT_SECONDS,
+        )
+
     try:
-        response = await loop.run_in_executor(None, _call, True)
+        response = await _attempt(True)
+    except asyncio.TimeoutError:
+        log.error(f"[INTENT] intent extraction timed out after {INTENT_TIMEOUT_SECONDS}s")
+        return None
     except BadRequestError as exc:
         log.warning(f"[INTENT] forced tool_choice rejected ({exc}); retrying unforced")
         try:
-            response = await loop.run_in_executor(None, _call, False)
+            response = await _attempt(False)
+        except asyncio.TimeoutError:
+            log.error(f"[INTENT] unforced intent extraction timed out "
+                      f"after {INTENT_TIMEOUT_SECONDS}s")
+            return None
         except Exception as retry_exc:  # noqa: BLE001
             log.error(f"[INTENT] intent extraction failed: {retry_exc}")
             return None
     except (AuthenticationError, NotFoundError, RateLimitError):
+        # Distinct from this app's own 30/min per-IP limit; let /query map it.
         raise
     except Exception as exc:  # noqa: BLE001
         log.error(f"[INTENT] intent extraction failed: {exc}")
@@ -1147,6 +1177,8 @@ def _render_intent_result(plan: IntentPlan, result, resolved: Optional[dict]) ->
                         )
                 summary = "; ".join(changed) if changed else "already had the requested values"
                 answer = f"Updated '{result['name']}': {summary}."
+        if plan.note:
+            answer = f"{answer} {plan.note}"
         return QueryResponse(answer=answer, tool_used=None, data=_public_rows([result]))
 
     # Reads: an empty dict is how get_product_details reports "not found".
@@ -1297,6 +1329,8 @@ async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> Que
             pending = None
         else:
             merged = merge_intent(pending.raw_intent, raw)
+            # The answer's own wording is also a source of required values.
+            merged = salvage_missing_create_fields(merged, question)
             intent = build_intent(merged, question)
             raw = merged
 
@@ -1315,6 +1349,11 @@ async def _run_llm_intent(question: str, user_id: int, tools: list[dict]) -> Que
                 "I could not tell which of the listed products you meant. "
                 "Please repeat the full product name."
             )
+
+    # A first-turn create may also have stated values the model did not extract.
+    if pending is None:
+        raw = salvage_missing_create_fields(raw, question)
+        intent = build_intent(raw, question)
 
     outcome = validate_intent(intent, question, allowed_ids=allowed_ids)
     _observe(

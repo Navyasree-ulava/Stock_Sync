@@ -233,6 +233,7 @@ The backend loads the repository-root `.env` file.
 | `LLM_MAX_TURNS` | No | `10` | Maximum model/tool loop iterations (legacy path) |
 | `USE_LLM_INTENT` | No | `true` | `false` falls back to the legacy regex router |
 | `LLM_MAX_CLARIFICATIONS` | No | `3` | Follow-up questions before asking the user to restate |
+| `LLM_INTENT_TIMEOUT` | No | `30` | Seconds allowed for one intent-extraction call |
 | `ELEVENLABS_API_KEY` | For TTS | none | ElevenLabs credential |
 | `ELEVENLABS_VOICE_ID` | For TTS | none | ElevenLabs voice ID |
 | `ELEVENLABS_MODEL` | No | `eleven_flash_v2_5` | ElevenLabs speech model |
@@ -358,6 +359,22 @@ to the browser, and the chat UI renders no tool tags.
 Set `USE_LLM_INTENT=false` to fall back to the legacy regex router, which is still shipped and
 still covered by tests.
 
+## Category identity
+
+A category's identity is case- and whitespace-insensitive for **every** category, current or
+future: `Grains` = `grains` = `GRAINS` = ` Grains `.
+
+One strategy is used everywhere: `normalize(category) = trim + lowercase`
+(`db.models.normalize_category`). The stored value is always the normalized form; the display
+label is derived from it (`db.models.display_category`, e.g. `grains` -> `Grains`).
+
+It is applied to writes (MCP create/update, REST create/update, CSV/XLSX import), grouping
+and counts (`get_all_categories`, `get_category_analytics`, `/inventory/stats`), filtering
+(`get_products_by_category`, `search_inventory`, `/inventory/products?category=`), and to
+categories extracted by the LLM. The model's casing is never trusted. A startup backfill
+rewrites pre-existing rows in place, so legacy `Grains`/`grains` rows collapse to one
+category without merging or losing products.
+
 ## Data model
 
 | Table | Purpose |
@@ -378,7 +395,7 @@ python -m pip install pytest pytest-asyncio
 python -m pytest -v
 ```
 
-The repository currently defines 162 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, LLM structured-intent extraction, canonical tool mapping, required-field enforcement, clarification and resume, ambiguity handling, delete confirmation and cancellation, create-versus-restock, multi-target refusal, provider-failure fallback, response-sanitization, legacy routing, fuzzy product-name resolution, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. The model is stubbed in the automated suite; everything after extraction, including the MCP tools and the database, is real, and the live Docker workflow exercises the real Groq model. There is currently no frontend test or lint command.
+The repository currently defines 258 tests across authentication/security, integration, importer rollback, MCP CRUD, combined field updates, numeric preservation, LLM structured-intent extraction, canonical tool mapping, required-field enforcement, multi-field clarification, clarification and resume, ambiguity handling, delete confirmation and cancellation, create-versus-restock, multi-target refusal, provider-failure fallback, response-sanitization, category case-insensitivity (arbitrary categories, MCP + REST + import + LLM intent), legacy routing, fuzzy product-name resolution, tenant isolation (including the audit-log join), LIKE-wildcard escaping, and migration coverage. Extraction hardening adds deterministic coverage for number and currency forms, under-extraction recovery, field ordering, follow-up merging, partial clarification answers, update field scoping, read-versus-mutation classification, and provider timeout/rate-limit state handling. The model is stubbed in the automated suite; everything after extraction, including the MCP tools and the database, is real, and the live Docker workflow exercises the real Groq model. There is currently no frontend test or lint command.
 
 Build the frontend with:
 
@@ -443,11 +460,22 @@ StockSync/
 - Chat messages are stored and displayed. The assistant keeps no conversational memory beyond a pending clarification, which is held in process memory and expires after 15 minutes.
 - The pending-clarification store is in-process. With more than one backend replica it must move to shared storage, or a clarification started on one replica will not be visible to another.
 - Product-name ambiguity is resolved from the user's own words only when one candidate is a clear winner; otherwise the assistant asks. It never picks arbitrarily.
-- The model occasionally under-reports a missing field. The backend recomputes the required
-  set for every mutation, so an omitted field is still requested, though the question can
-  sometimes ask for a field the user already gave.
-- The LLM extraction call has no timeout. A slow provider can hold a request for a long time
-  (observed up to ~60s). MCP tool calls are bounded at 30s; the model call is not.
+- The model occasionally under-reports a field the user clearly stated. The backend recomputes
+  the required set for every mutation and then makes a second, deterministic pass over the
+  user's own words to recover values the model dropped, so a field is rarely asked for twice.
+  That recovery is deliberately conservative: it only fills a value the user literally wrote,
+  it never overwrites a value the model got right, and it declines rather than guess.
+- Numbers are parsed for the common forms (`100000`, `1,00,000`, `₹100000`, `Rs 500`, `100k`,
+  `1 lakh`, `1 crore`, `60 units`). An expression the parser does not understand yields no
+  value rather than an approximation, which means an unusual format is asked for again.
+- The LLM extraction call is bounded at `LLM_INTENT_TIMEOUT` seconds (default 30). A provider
+  timeout or error never creates clarification state. A provider rate-limit (HTTP 429 from
+  Groq) is reported as such and is distinct from this application's own per-IP limit; it
+  leaves an in-progress clarification intact so the user can simply retry, and the
+  abandoned-request check drops that clarification as soon as the user names something else.
+- A supplier cannot be changed after a product is created, because the MCP update contract
+  has no settable supplier field. The backend applies the supported part of such a request
+  and says plainly that the supplier was left alone.
 - A request naming several products for one mutation is refused rather than partially applied.
 - The deterministic legacy regex router is retained only as a fallback behind `USE_LLM_INTENT=false`; it is not the default path.
 - Dashboard value and low-stock analytics are calculated in the browser from at most 200 fetched products and are not authoritative for larger inventories.
